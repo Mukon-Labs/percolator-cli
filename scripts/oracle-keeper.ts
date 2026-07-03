@@ -136,10 +136,16 @@ async function pushPrices() {
       tx.add(ix);
       tx.sign(payer);
 
-      // Fire and move on; confirm with timeout per market
+      // Fire and move on; confirm with timeout per market.
+      // The confirm promise may outlive the race — attach a catch so a late
+      // RPC failure (e.g. ECONNRESET) can't become an unhandled rejection
+      // that kills the process.
       const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true });
+      const confirmPromise = conn
+        .confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed")
+        .catch(() => null);
       const result = await Promise.race([
-        conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed"),
+        confirmPromise,
         sleep(TX_TIMEOUT_MS).then(() => null),
       ]);
       if (result && result.value.err) {
@@ -174,6 +180,12 @@ pushPrices();
 
 // Main loop — never exits on errors
 setInterval(pushPrices, PUSH_INTERVAL_MS);
+
+// Never die on a stray async failure — log and keep pushing
+process.on("unhandledRejection", (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  console.error(`  [unhandledRejection] ${msg.slice(0, 120)}`);
+});
 
 // Graceful shutdown on Ctrl+C only
 process.on("SIGINT", () => {
