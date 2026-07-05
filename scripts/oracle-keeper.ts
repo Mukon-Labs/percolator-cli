@@ -61,9 +61,24 @@ function sleep(ms: number) {
 
 // --- Main ---
 const conn = new Connection(RPC_URL, "confirmed");
-const payer = Keypair.fromSecretKey(
-  Uint8Array.from(JSON.parse(fs.readFileSync(DEPLOYER_PATH, "utf8")))
-);
+
+// Load the oracle-authority key. On a host (Railway/VPS) there is no local
+// keypair file, so prefer KEEPER_SECRET_KEY (a JSON array like a Solana
+// keypair file, or a base64 of one). Fall back to the local file for dev.
+function loadKeypair(): Keypair {
+  const envKey = process.env.KEEPER_SECRET_KEY;
+  if (envKey) {
+    const trimmed = envKey.trim();
+    const json = trimmed.startsWith("[")
+      ? trimmed
+      : Buffer.from(trimmed, "base64").toString("utf8");
+    return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(json)));
+  }
+  return Keypair.fromSecretKey(
+    Uint8Array.from(JSON.parse(fs.readFileSync(DEPLOYER_PATH, "utf8")))
+  );
+}
+const payer = loadKeypair();
 
 console.log(`Oracle Keeper started`);
 console.log(`  Program: ${PROGRAM_ID.toBase58()}`);
