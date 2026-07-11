@@ -8,6 +8,7 @@
  * 2. Pushes price to slab via PushOraclePrice instruction
  * 3. Backs off exponentially on errors; never exits
  */
+import "dotenv/config";
 import {
   Connection,
   Keypair,
