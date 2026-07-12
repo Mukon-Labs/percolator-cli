@@ -12,8 +12,8 @@
   "scripts": {
     "build": "tsup",
     "dev": "pnpm build && node dist/index.js",
-    "start": "tsx scripts/oracle-keeper.ts",
-    "keeper": "tsx scripts/oracle-keeper.ts",
+    "start": "tsx scripts/oracle-keeper-v16.ts",
+    "keeper": "tsx scripts/oracle-keeper-v16.ts",
     "test": "tsx test/abi.test.ts && tsx test/pda.test.ts && tsx test/slab.test.ts && tsx test/validation.test.ts && tsx test/oracle.test.ts"
   },
   "dependencies": {
