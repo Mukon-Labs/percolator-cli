@@ -24,8 +24,8 @@ const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID ?? "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq"
 );
 // The live v16 market group + its LP portfolio (asset 0 = SOL).
-const MARKET = new PublicKey(process.env.MARKET ?? "F73ehBXD5H19oRT6ed5Z591Zrf1hx61K93CH8ugyDiSC");
-const LP_PORTFOLIO = new PublicKey(process.env.LP_PORTFOLIO ?? "AsyzqWDMDe8p2HNUUeCtrQ1jnyCJvjhLfXx3suRQSjvf");
+const MARKET = new PublicKey(process.env.MARKET ?? "5R8JDc8zJyVgP34vB7fHGD5262W5qid7u8SEEbe76u6A");
+const LP_PORTFOLIO = new PublicKey(process.env.LP_PORTFOLIO ?? "FrfVp5LcrwDncynm8zarmUppG624Zbf1oBdNFpZvD47i");
 
 /** Assets listed on the v16 market group (index order is fixed on-chain). */
 const ASSETS: Array<{ index: number; symbol: string; feedId: string }> = [
