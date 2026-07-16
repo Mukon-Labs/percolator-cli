@@ -31,8 +31,8 @@ const RPC_URL = process.env.RPC_URL ?? "https://api.devnet.solana.com";
 const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID ?? "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq"
 );
-const MARKET = new PublicKey(process.env.MARKET ?? "5R8JDc8zJyVgP34vB7fHGD5262W5qid7u8SEEbe76u6A");
-const LP_PORTFOLIO = new PublicKey(process.env.LP_PORTFOLIO ?? "FrfVp5LcrwDncynm8zarmUppG624Zbf1oBdNFpZvD47i");
+const MARKET = new PublicKey(process.env.MARKET ?? "DNhYhm8Pb2yRjTpk7SNXrevX8zNZ9eZuivxgxyNtwyPP");
+const LP_PORTFOLIO = new PublicKey(process.env.LP_PORTFOLIO ?? "BWqxjf1GoYqRNZTy6h1txPxBtiiN9MyF5Hd2JtKYGVwS");
 
 /** Assets listed on the v16 market group (index order is fixed on-chain). */
 const ASSETS: Array<{ index: number; symbol: string; feedId: string }> = [
