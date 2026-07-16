@@ -39,6 +39,7 @@ const ASSETS: Array<{ index: number; symbol: string; feedId: string }> = [
   { index: 0, symbol: "SOL", feedId: "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d" },
   { index: 1, symbol: "BTC", feedId: "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43" },
   { index: 2, symbol: "ETH", feedId: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace" },
+  { index: 3, symbol: "ZEC", feedId: "be9b59d178f0d6a97ab4c343bff2aa69caa1eaae3e9048a65788c529b125bb24" },
 ];
 const PYTH_HERMES_URL = "https://hermes.pyth.network";
 const PUSH_INTERVAL_MS = 5000;
