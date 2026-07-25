@@ -1,11 +1,15 @@
 # Fly.io config for the Ninja Trade oracle keeper.
 # A worker process (no inbound HTTP), so there is no [http_service] block.
 #
-# First deploy:
-#   fly launch --no-deploy --copy-config --name ninja-oracle-keeper
-#   fly secrets set RPC_URL="https://devnet.helius-rpc.com/?api-key=YOUR_KEY"
-#   fly secrets set KEEPER_SECRET_KEY="$(base64 -i ~/.config/solana/mukon-deployer.json)"
-#   fly deploy
+# Existing-singleton update only: do not create, clone, scale, or add HA.
+# Before any authorized deploy/resume, verify names-only secret presence, zero
+# local keeper processes, and exactly one stopped hosted keeper machine.
+# After review, the operator stages secrets only with `fly secrets set --stage`;
+# values never belong here. Fresh deployment authorization then uses:
+# `fly deploy -a ninja-oracle-keeper --ha=false --update-only --only-machines <id> --strategy immediate`.
+#
+# RPC_URL must be the keeper-only Helius credential. KEEPER_SECRET_KEY is the
+# existing Solana oracle-authority signer; keep both values out of this file.
 #
 # Set primary_region to match your other Mukon apps (fly platform regions).
 
@@ -17,14 +21,14 @@ primary_region = "iad"
 
 [env]
   # Non-secret defaults. RPC_URL and KEEPER_SECRET_KEY come from `fly secrets`.
-  # PROGRAM_ID defaults to the deployed checkpoint-v2 program in the code.
+  # PROGRAM_ID defaults to the deployed v16 program in the code.
 
-# Single always-on machine — the keeper must run continuously. Fly restarts
-# the machine if the process exits.
+# One intended keeper only. Deploy changes the existing release; starting the
+# verified stopped machine is a separate, authorized resume operation.
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"
 
 [deploy]
-  # Only ever one keeper — two would double-push prices (harmless but wasteful).
+  # Existing machine only — never introduce a second/HA keeper.
   strategy = "immediate"
