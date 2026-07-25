@@ -25,9 +25,33 @@ import {
   Connection, Keypair, PublicKey, SystemProgram, Transaction,
   TransactionInstruction, ComputeBudgetProgram,
 } from "@solana/web3.js";
-import * as fs from "fs";
+import {
+  abortableSleep,
+  classifyKeeperError,
+  confirmConnectionTransaction,
+  confirmedTransactionError,
+  ensureUsableCrankBuffer,
+  formatUnhandledRejection,
+  isUsableLeglessCrankBuffer,
+  KeeperLifecycle,
+  KeeperFailure,
+  isCustomProgramError,
+  parseKeeperSecretKey,
+  PushWatchdog,
+  RpcCircuitBreaker,
+  RpcOperationSignalScope,
+  requireConfiguredHermesFeeds,
+  requireKeeperConfiguration,
+  runDeadlineBoundOperation,
+  runBoundedSelfHeal,
+  safeErrorMessage,
+  SingleTickRunner,
+  systemClock,
+  retryAfterMs,
+} from "./keeper-runtime.ts";
 
-const RPC_URL = process.env.RPC_URL ?? "https://api.devnet.solana.com";
+const keeperConfiguration = requireKeeperConfiguration(process.env);
+const RPC_URL = keeperConfiguration.rpcUrl;
 const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID ?? "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq"
 );
@@ -52,18 +76,26 @@ const CATCHUP_TXS_PER_TICK = 4;    // self-heal budget per tick (~180 slots each
 const CATCHUP_CRANKS_PER_TX = 9;
 
 function loadKeypair(): Keypair {
-  const envKey = process.env.KEEPER_SECRET_KEY;
-  if (envKey) {
-    const t = envKey.trim();
-    const json = t.startsWith("[") ? t : Buffer.from(t, "base64").toString("utf8");
-    return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(json)));
+  try {
+    return Keypair.fromSecretKey(parseKeeperSecretKey(keeperConfiguration.encodedSecretKey));
+  } catch {
+    // Do not leak a malformed source fragment through boot/unhandled handlers.
+    throw new KeeperFailure("unknown", "invalid KEEPER_SECRET_KEY");
   }
-  return Keypair.fromSecretKey(
-    Uint8Array.from(JSON.parse(fs.readFileSync(`${process.env.HOME}/.config/solana/mukon-deployer.json`, "utf8")))
-  );
 }
 
-const conn = new Connection(RPC_URL, "confirmed");
+const rpcOperationSignals = new RpcOperationSignalScope();
+const conn = new Connection(RPC_URL, {
+  commitment: "confirmed",
+  // web3.js otherwise retries every 429 several times inside each logical RPC.
+  // The keeper owns the retry policy so provider failures cannot amplify.
+  disableRetryOnRateLimit: true,
+  confirmTransactionInitialTimeout: TX_TIMEOUT_MS,
+  fetchMiddleware: (url, options, fetch) => fetch(url, {
+    ...(options ?? {}),
+    signal: rpcOperationSignals.currentSignal() ?? options?.signal,
+  }),
+});
 const payer = loadKeypair();
 const CRANK_BUFFER_SEED = "ninja-crank-buffer";
 let crankBuffer: PublicKey; // legless portfolio used only for catch-up cranks
@@ -107,10 +139,31 @@ function ixCrank(portfolio: PublicKey, assetIndexes: number[], nowSlot: bigint):
   });
 }
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+async function withRpcSignal<T>(signal: AbortSignal, work: () => Promise<T>): Promise<T> {
+  if (signal.aborted) throw new KeeperFailure("cancelled", "keeper RPC work cancelled");
+  if (rpcOperationSignals.currentSignal()) {
+    throw new KeeperFailure("unknown", "concurrent keeper RPC work rejected");
+  }
+  return rpcOperationSignals.run(signal, async () => {
+    try {
+      return await work();
+    } catch (error) {
+      if (signal.aborted) {
+        throw new KeeperFailure("timeout", "keeper RPC deadline exceeded");
+      }
+      throw error;
+    }
+  });
+}
 
-async function sendIxs(ixs: TransactionInstruction[], cuLimit: number): Promise<{ sig: string; err: unknown | null }> {
+async function sendIxs(
+  ixs: TransactionInstruction[],
+  cuLimit: number,
+  signal: AbortSignal,
+): Promise<{ sig: string; err: unknown | null }> {
+  if (signal.aborted) throw new Error("keeper operation cancelled");
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+  if (signal.aborted) throw new Error("keeper operation cancelled");
   const tx = new Transaction();
   tx.recentBlockhash = blockhash;
   tx.feePayer = payer.publicKey;
@@ -118,48 +171,77 @@ async function sendIxs(ixs: TransactionInstruction[], cuLimit: number): Promise<
   tx.add(ComputeBudgetProgram.requestHeapFrame({ bytes: 256 * 1024 }));
   tx.add(...ixs);
   tx.sign(payer);
-  const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true });
-  const result = await Promise.race([
-    conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed").catch(() => null),
-    sleep(TX_TIMEOUT_MS).then(() => null),
-  ]);
-  return { sig, err: result?.value?.err ?? null };
+  const sig = await conn.sendRawTransaction(tx.serialize(), {
+    skipPreflight: true,
+    maxRetries: 0,
+  });
+
+  // The operation signal is used by both Connection.confirmTransaction and
+  // fetchMiddleware, so the 8s confirmation cap cancels subscription and HTTP
+  // fallback polls rather than merely releasing this caller.
+  const result = await confirmConnectionTransaction({
+    connection: conn,
+    parentSignal: signal,
+    runWithOperationSignal: (operationSignal, work) => rpcOperationSignals.run(operationSignal, work),
+    strategy: { signature: sig, blockhash, lastValidBlockHeight },
+    timeoutMs: TX_TIMEOUT_MS,
+  });
+  return { sig, err: confirmedTransactionError(result) };
 }
 
 /** Ensure the legless crank-buffer portfolio exists (created once, ~0.066 SOL rent). */
-async function ensureCrankBuffer(): Promise<void> {
+async function ensureCrankBuffer(signal: AbortSignal): Promise<void> {
   crankBuffer = await PublicKey.createWithSeed(payer.publicKey, CRANK_BUFFER_SEED, PROGRAM_ID);
-  const info = await conn.getAccountInfo(crankBuffer, "confirmed");
-  if (info) return;
+  const isUsableBuffer = (info: Awaited<ReturnType<typeof conn.getAccountInfo>>) => info !== null
+    && isUsableLeglessCrankBuffer({
+      data: info.data,
+      expectedLength: PORTFOLIO_ACCOUNT_LEN,
+      expectedMarket: MARKET.toBytes(),
+      expectedPortfolio: crankBuffer.toBytes(),
+      programOwnerMatches: info.owner.equals(PROGRAM_ID),
+    });
   const rent = await conn.getMinimumBalanceForRentExemption(PORTFOLIO_ACCOUNT_LEN);
   const initData = Buffer.from([1]); // InitPortfolio (tag 1)
-  const { err } = await sendIxs([
-    SystemProgram.createAccountWithSeed({
-      fromPubkey: payer.publicKey, newAccountPubkey: crankBuffer,
-      basePubkey: payer.publicKey, seed: CRANK_BUFFER_SEED,
-      lamports: rent, space: PORTFOLIO_ACCOUNT_LEN, programId: PROGRAM_ID,
-    }),
-    new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: payer.publicKey, isSigner: true, isWritable: false },
-        { pubkey: MARKET, isSigner: false, isWritable: true },
-        { pubkey: crankBuffer, isSigner: false, isWritable: true },
-      ],
-      data: initData,
-    }),
-  ], 200_000);
-  console.log(`  crank buffer ${err ? "create FAILED " + JSON.stringify(err) : "created"}: ${crankBuffer.toBase58()}`);
+  await ensureUsableCrankBuffer({
+    read: () => conn.getAccountInfo(crankBuffer, "confirmed"),
+    isUsable: isUsableBuffer,
+    create: async () => {
+      const { err } = await sendIxs([
+        SystemProgram.createAccountWithSeed({
+          fromPubkey: payer.publicKey, newAccountPubkey: crankBuffer,
+          basePubkey: payer.publicKey, seed: CRANK_BUFFER_SEED,
+          lamports: rent, space: PORTFOLIO_ACCOUNT_LEN, programId: PROGRAM_ID,
+        }),
+        new TransactionInstruction({
+          programId: PROGRAM_ID,
+          keys: [
+            { pubkey: payer.publicKey, isSigner: true, isWritable: false },
+            { pubkey: MARKET, isSigner: false, isWritable: true },
+            { pubkey: crankBuffer, isSigner: false, isWritable: true },
+          ],
+          data: initData,
+        }),
+      ], 200_000, signal);
+      if (err) throw new KeeperFailure("onchain", "crank buffer create rejected on-chain");
+    },
+  });
+  console.log(`  crank buffer ready: ${crankBuffer.toBase58()}`);
 }
 
 /** Loss-stale self-heal: advance asset clocks via the legless buffer. */
-async function selfHeal(pushed: number[]): Promise<void> {
-  for (let i = 0; i < CATCHUP_TXS_PER_TICK; i++) {
-    const nowSlot = BigInt(await conn.getSlot("confirmed"));
-    const ixs = Array.from({ length: CATCHUP_CRANKS_PER_TX }, () => ixCrank(crankBuffer, pushed, nowSlot));
-    const { err } = await sendIxs(ixs, 1_400_000);
-    if (err) { console.log(`  self-heal tx err: ${JSON.stringify(err)}`); break; }
-  }
+async function selfHeal(pushed: number[], signal: AbortSignal): Promise<void> {
+  await runBoundedSelfHeal({
+    batchesPerTick: CATCHUP_TXS_PER_TICK,
+    cranksPerBatch: CATCHUP_CRANKS_PER_TX,
+    signal,
+    runBatch: async (cranksPerBatch) => {
+      const nowSlot = BigInt(await conn.getSlot("confirmed"));
+      const ixs = Array.from({ length: cranksPerBatch }, () => ixCrank(crankBuffer, pushed, nowSlot));
+      const { err } = await sendIxs(ixs, 1_400_000, signal);
+      if (err) console.log("  self-heal tx rejected");
+      return err === null;
+    },
+  });
 }
 
 console.log("Oracle Keeper (v16, hardened v2) started");
@@ -170,52 +252,83 @@ console.log(`  Auth:    ${payer.publicKey.toBase58()}`);
 console.log(`  Push:    every ${PUSH_INTERVAL_MS}ms\n`);
 
 let consecutiveErrors = 0;
-let isPushing = false;
-let lastPushOkMs = Date.now(); // watchdog anchor (boot counts as ok)
 let healing = false;
+const rpcCircuit = new RpcCircuitBreaker(systemClock);
+const tickRunner = new SingleTickRunner(systemClock, TICK_DEADLINE_MS);
+const bootRunner = new SingleTickRunner(systemClock, TICK_DEADLINE_MS);
+const watchdog = new PushWatchdog(Date.now());
+const shutdown = new AbortController();
+const lifecycle = new KeeperLifecycle({ clearInterval, setInterval }, (code) => process.exit(code));
+let watchdogSuppressedUntil = 0;
+let transientBackoffUntil = 0;
 
-async function tickInner() {
-  // One Hermes request for every listed asset.
-  const controller = new AbortController();
-  const ft = setTimeout(() => controller.abort(), 5000);
-  let resp: Response;
-  try {
-    const q = ASSETS.map((a) => `ids[]=${a.feedId}`).join("&");
-    resp = await fetch(`${PYTH_HERMES_URL}/v2/updates/price/latest?${q}`, { signal: controller.signal });
-  } finally { clearTimeout(ft); }
-  if (!resp.ok) throw new Error(`Pyth HTTP ${resp.status}`);
-  const data = await resp.json();
-  const parsed: Array<{ id: string; price: { price: string; expo: number } }> = data.parsed ?? [];
-  if (!parsed.length) throw new Error("No price data");
+function stopKeeper(): void {
+  if (lifecycle.isTerminal()) return;
+  // Mark terminal before waiting: intervals are cleared immediately, then the
+  // process exits only after cancellation reaches active RPC/confirmation work.
+  void lifecycle.terminate(async () => {
+    shutdown.abort();
+    tickRunner.abortActive();
+    bootRunner.abortActive();
+    await Promise.all([tickRunner.drain(), bootRunner.drain()]);
+  });
+}
+
+process.once("SIGINT", stopKeeper);
+process.once("SIGTERM", stopKeeper);
+
+async function tickInner(signal: AbortSignal) {
+  // Keep the Hermes operation signal alive through headers, body parsing, and
+  // configured-feed validation; a headers-only response must not outlive tick.
+  const feeds = await runDeadlineBoundOperation({
+    parentSignal: signal,
+    timeoutMs: 5000,
+    work: async (hermesSignal) => {
+      const q = ASSETS.map((a) => `ids[]=${a.feedId}`).join("&");
+      const resp = await fetch(`${PYTH_HERMES_URL}/v2/updates/price/latest?${q}`, { signal: hermesSignal });
+      if (!resp.ok) {
+        throw new KeeperFailure(
+          resp.status === 429 ? "rate_limit" : "transport",
+          `Pyth HTTP ${resp.status}`,
+          retryAfterMs(resp.headers, Date.now()),
+        );
+      }
+      const data = await resp.json();
+      const parsed: Array<{ id: string; price: { price: string; expo: number } }> = data.parsed ?? [];
+      return requireConfiguredHermesFeeds(ASSETS.map((asset) => asset.feedId), parsed);
+    },
+  });
 
   const nowSlot = BigInt(await conn.getSlot("confirmed"));
   const pushIxs: TransactionInstruction[] = [];
   const pushed: number[] = [];
   const parts: string[] = [];
   for (const a of ASSETS) {
-    const item = parsed.find((p) => p.id === a.feedId);
-    if (!item) { parts.push(`${a.symbol} n/a`); continue; }
+    const item = feeds.get(a.feedId)!;
     const price = Number(item.price.price) * Math.pow(10, item.price.expo);
     pushIxs.push(ixPushAuthMark(a.index, nowSlot, BigInt(Math.round(price * 1_000_000))));
     pushed.push(a.index);
     parts.push(`${a.symbol} $${price.toFixed(price >= 1000 ? 0 : 2)}`);
   }
-  if (!pushed.length) throw new Error("No feeds matched");
-
   // Tx 1: PUSHES ONLY — must always land, whatever the crank thinks.
-  const push = await sendIxs(pushIxs, 400_000);
-  if (push.err) throw new Error(`push err: ${JSON.stringify(push.err)}`);
-  lastPushOkMs = Date.now();
+  const push = await sendIxs(pushIxs, 400_000, signal);
+  if (push.err) throw new KeeperFailure("onchain", "oracle push rejected on-chain");
+  // A watchdog/circuit recovery only advances after a confirmation that contains
+  // an explicit null on-chain error, never after timeout, cancellation, or a
+  // missing confirmation result.
+  watchdog.recordConfirmedPush(Date.now(), true);
+  rpcCircuit.recordConfirmedSuccess();
+  watchdogSuppressedUntil = 0;
 
   // Tx 2: crank the LP (settles its legs, advances effective prices).
-  const crank = await sendIxs([ixCrank(LP_PORTFOLIO, pushed, nowSlot)], 600_000);
+  const crank = await sendIxs([ixCrank(LP_PORTFOLIO, pushed, nowSlot)], 600_000, signal);
   const time = new Date().toISOString().slice(11, 19);
   if (crank.err) {
-    const isLossStale = JSON.stringify(crank.err).includes('"Custom":21');
-    console.log(`  [${time}] ${parts.join("  ")} push ✓, crank err ${JSON.stringify(crank.err)}${isLossStale ? " -> self-heal" : ""}`);
+    const isLossStale = isCustomProgramError(crank.err, 21);
+    console.log(`  [${time}] ${parts.join("  ")} push ✓, crank rejected${isLossStale ? " -> self-heal" : ""}`);
     if (isLossStale && !healing) {
       healing = true;
-      try { await selfHeal(pushed); } finally { healing = false; }
+      try { await selfHeal(pushed, signal); } finally { healing = false; }
     }
   } else {
     console.log(`  [${time}] ${parts.join("  ")} push+crank ✓ ${crank.sig.slice(0, 8)}…`);
@@ -224,44 +337,73 @@ async function tickInner() {
 }
 
 async function tick() {
-  if (isPushing) return;
-  isPushing = true;
+  if (lifecycle.isTerminal() || shutdown.signal.aborted || rpcCircuit.isOpen() || Date.now() < transientBackoffUntil) return;
   try {
-    // Hard deadline: a wedged await can never latch the guard again.
-    await Promise.race([
-      tickInner(),
-      sleep(TICK_DEADLINE_MS).then(() => { throw new Error("tick deadline exceeded"); }),
-    ]);
+    const started = await tickRunner.run((signal) => withRpcSignal(signal, () => tickInner(signal)));
+    if (!started) return;
   } catch (err: unknown) {
     consecutiveErrors++;
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`  [${new Date().toISOString().slice(11, 19)}] Error #${consecutiveErrors}: ${msg.slice(0, 140)}`);
-    if (consecutiveErrors >= 3) {
+    const failure = classifyKeeperError(err);
+    console.error(`  [${new Date().toISOString().slice(11, 19)}] Error #${consecutiveErrors}: ${safeErrorMessage(failure).slice(0, 140)}`);
+    const circuitBackoff = rpcCircuit.recordFailure(failure);
+    if (circuitBackoff !== null) {
+      // A provider outage must not create a Fly restart loop. Give a recovered
+      // endpoint a full watchdog window to land the first push.
+      watchdogSuppressedUntil = Date.now() + circuitBackoff + WATCHDOG_MS;
+      console.error(`  RPC circuit open for ${(circuitBackoff / 1000).toFixed(0)}s`);
+    } else if (consecutiveErrors >= 3) {
       const backoff = Math.min(PUSH_INTERVAL_MS * Math.pow(2, consecutiveErrors - 2), MAX_BACKOFF_MS);
+      transientBackoffUntil = Date.now() + backoff;
       console.error(`  Backing off ${(backoff / 1000).toFixed(0)}s…`);
-      await sleep(backoff);
     }
-  } finally {
-    isPushing = false;
   }
 }
 
 // WATCHDOG: if pushes stop landing, die loudly — Fly restarts the machine.
-setInterval(() => {
-  if (Date.now() - lastPushOkMs > WATCHDOG_MS) {
+lifecycle.every(() => {
+  if (Date.now() < watchdogSuppressedUntil) return;
+  if (watchdog.shouldRestart(Date.now(), WATCHDOG_MS)) {
     console.error(`WATCHDOG: no successful push for ${WATCHDOG_MS / 1000}s — exiting for restart`);
-    process.exit(1);
+    void lifecycle.terminate(async () => {
+      shutdown.abort();
+      tickRunner.abortActive();
+      bootRunner.abortActive();
+      await Promise.all([tickRunner.drain(), bootRunner.drain()]);
+    }, 1);
   }
 }, 15_000);
 
 process.on("unhandledRejection", (reason) => {
-  console.error(`  [unhandledRejection] ${reason instanceof Error ? reason.message : String(reason)}`.slice(0, 140));
+  console.error(`  ${formatUnhandledRejection(reason)}`);
 });
 
-ensureCrankBuffer().then(() => {
-  tick();
-  setInterval(tick, PUSH_INTERVAL_MS);
-}).catch((e) => {
-  console.error("boot failed:", e.message ?? e);
-  process.exit(1);
+async function boot(): Promise<void> {
+  for (;;) {
+    try {
+      if (shutdown.signal.aborted) throw new KeeperFailure("cancelled", "keeper shutdown requested");
+      await bootRunner.run((signal) => withRpcSignal(signal, () => ensureCrankBuffer(signal)));
+      break;
+    } catch (error) {
+      const failure = classifyKeeperError(error);
+      const backoff = rpcCircuit.recordFailure(failure);
+      if (backoff === null) throw failure;
+      watchdogSuppressedUntil = Date.now() + backoff + WATCHDOG_MS;
+      console.error(`boot RPC circuit open for ${Math.ceil(backoff / 1000)}s`);
+      await abortableSleep(backoff, shutdown.signal);
+    }
+  }
+  if (lifecycle.isTerminal()) return;
+  void tick();
+  lifecycle.every(() => { void tick(); }, PUSH_INTERVAL_MS);
+}
+
+boot().catch((error) => {
+  if (lifecycle.isTerminal()) return;
+  console.error("boot failed:", safeErrorMessage(error));
+  void lifecycle.terminate(async () => {
+    shutdown.abort();
+    tickRunner.abortActive();
+    bootRunner.abortActive();
+    await Promise.all([tickRunner.drain(), bootRunner.drain()]);
+  }, 1);
 });
