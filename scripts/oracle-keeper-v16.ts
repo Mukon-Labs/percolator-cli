@@ -30,6 +30,7 @@ import {
   classifyKeeperError,
   confirmConnectionTransaction,
   confirmedTransactionError,
+  crankBufferSeedForMarket,
   ensureUsableCrankBuffer,
   formatUnhandledRejection,
   isUsableLeglessCrankBuffer,
@@ -97,7 +98,6 @@ const conn = new Connection(RPC_URL, {
   }),
 });
 const payer = loadKeypair();
-const CRANK_BUFFER_SEED = "ninja-crank-buffer";
 let crankBuffer: PublicKey; // legless portfolio used only for catch-up cranks
 
 // PushAuthMark (tag 63): [63, asset_index:u16, now_slot:u64, mark_e6:u64]
@@ -191,7 +191,11 @@ async function sendIxs(
 
 /** Ensure the legless crank-buffer portfolio exists (created once, ~0.066 SOL rent). */
 async function ensureCrankBuffer(signal: AbortSignal): Promise<void> {
-  crankBuffer = await PublicKey.createWithSeed(payer.publicKey, CRANK_BUFFER_SEED, PROGRAM_ID);
+  // v1 used one authority-wide seed, so a valid buffer for an old market
+  // occupied the live keeper's address. v2 scopes the deterministic address to
+  // this market; old accounts are never selected, repurposed, or deleted.
+  const crankBufferSeed = crankBufferSeedForMarket(MARKET.toBytes());
+  crankBuffer = await PublicKey.createWithSeed(payer.publicKey, crankBufferSeed, PROGRAM_ID);
   const isUsableBuffer = (info: Awaited<ReturnType<typeof conn.getAccountInfo>>) => info !== null
     && isUsableLeglessCrankBuffer({
       data: info.data,
@@ -209,7 +213,7 @@ async function ensureCrankBuffer(signal: AbortSignal): Promise<void> {
       const { err } = await sendIxs([
         SystemProgram.createAccountWithSeed({
           fromPubkey: payer.publicKey, newAccountPubkey: crankBuffer,
-          basePubkey: payer.publicKey, seed: CRANK_BUFFER_SEED,
+          basePubkey: payer.publicKey, seed: crankBufferSeed,
           lamports: rent, space: PORTFOLIO_ACCOUNT_LEN, programId: PROGRAM_ID,
         }),
         new TransactionInstruction({

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export type KeeperFailureKind = "cancelled" | "onchain" | "rate_limit" | "timeout" | "transport" | "unknown";
 
 export class KeeperFailure extends Error {
@@ -452,6 +454,22 @@ export function isUsableLeglessCrankBuffer(input: {
     || !equalBytes(data.subarray(V16_PROVENANCE_OFF, V16_PROVENANCE_OFF + 32), input.expectedMarket)
     || !equalBytes(data.subarray(V16_PROVENANCE_OFF + 32, V16_PROVENANCE_OFF + 64), input.expectedPortfolio)) return false;
   return view.getBigUint64(V16_ACTIVE_BITMAP_OFF, true) === 0n;
+}
+
+/**
+ * `createWithSeed` accepts at most 32 UTF-8 bytes. Hashing the complete market
+ * public-key bytes into this versioned seed makes a recovery buffer exclusive
+ * to one market without relying on a short base58 prefix. The domain separator
+ * prevents an accidental future reuse of this digest as another seed kind.
+ */
+export function crankBufferSeedForMarket(market: Uint8Array): string {
+  if (market.length !== 32) throw new KeeperFailure("unknown", "invalid market identity for crank buffer");
+  const digest = createHash("sha256")
+    .update("percolator/crank-buffer/v2", "utf8")
+    .update(market)
+    .digest("base64url");
+  // 7-byte prefix + 25 base64url characters = 32 bytes (150 bits of digest).
+  return `ncb-v2-${digest.slice(0, 25)}`;
 }
 
 /** Creation can race with a prior transaction or return an on-chain rejection

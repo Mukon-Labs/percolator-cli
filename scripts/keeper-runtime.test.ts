@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { PublicKey } from "@solana/web3.js";
 import {
   abortableSleep,
   classifyKeeperError,
   confirmConnectionTransaction,
   confirmedTransactionError,
   confirmationResultFromError,
+  crankBufferSeedForMarket,
   ensureUsableCrankBuffer,
   formatUnhandledRejection,
   isUsableLeglessCrankBuffer,
@@ -434,6 +436,70 @@ test("crank-buffer create rejection re-reads and accepts only a verified legless
     }),
     (error: unknown) => error instanceof KeeperFailure && error.kind === "onchain",
   );
+});
+
+test("market-scoped crank buffer ignores a legacy old-market buffer and selects an unused live candidate", async () => {
+  const authority = new PublicKey(new Uint8Array(32).fill(9));
+  const program = new PublicKey(new Uint8Array(32).fill(8));
+  const oldMarket = new Uint8Array(32).fill(1);
+  const liveMarket = new Uint8Array(32).fill(2);
+  const legacy = await PublicKey.createWithSeed(authority, "ninja-crank-buffer", program);
+  const liveSeed = crankBufferSeedForMarket(liveMarket);
+  const liveCandidate = await PublicKey.createWithSeed(authority, liveSeed, program);
+  const oldBuffer = usableBufferData();
+  oldBuffer.data.set(oldMarket, 16);
+  oldBuffer.data.set(legacy.toBytes(), 48);
+  const accounts = new Map<string, Uint8Array>([[legacy.toBase58(), oldBuffer.data]]);
+
+  assert.notEqual(liveSeed, "ninja-crank-buffer");
+  assert.notEqual(liveSeed, crankBufferSeedForMarket(oldMarket));
+  assert.notEqual(liveCandidate.toBase58(), legacy.toBase58());
+  assert.equal(isUsableLeglessCrankBuffer({
+    data: oldBuffer.data,
+    expectedLength: 9411,
+    expectedMarket: liveMarket,
+    expectedPortfolio: liveCandidate.toBytes(),
+    programOwnerMatches: true,
+  }), false, "the old-market account can never validate for the live candidate");
+  assert.equal(accounts.has(liveCandidate.toBase58()), false, "the live-market candidate starts unused");
+
+  const liveBuffer = usableBufferData();
+  liveBuffer.data.set(liveMarket, 16);
+  liveBuffer.data.set(liveCandidate.toBytes(), 48);
+  await ensureUsableCrankBuffer({
+    read: async () => accounts.get(liveCandidate.toBase58()) ?? null,
+    isUsable: (account) => account !== null && isUsableLeglessCrankBuffer({
+      data: account,
+      expectedLength: 9411,
+      expectedMarket: liveMarket,
+      expectedPortfolio: liveCandidate.toBytes(),
+      programOwnerMatches: true,
+    }),
+    create: async () => { accounts.set(liveCandidate.toBase58(), liveBuffer.data); },
+  });
+  assert.equal(accounts.get(legacy.toBase58()), oldBuffer.data, "legacy buffer is never repurposed");
+  assert.equal(accounts.get(liveCandidate.toBase58()), liveBuffer.data, "only the live candidate is selected");
+});
+
+test("existing valid live-market crank buffer remains usable without creation", async () => {
+  const liveMarket = new Uint8Array(32).fill(4);
+  const livePortfolio = new Uint8Array(32).fill(5);
+  const existing = usableBufferData();
+  existing.data.set(liveMarket, 16);
+  existing.data.set(livePortfolio, 48);
+  let creates = 0;
+  await ensureUsableCrankBuffer({
+    read: async () => existing.data,
+    isUsable: (account) => account !== null && isUsableLeglessCrankBuffer({
+      data: account,
+      expectedLength: 9411,
+      expectedMarket: liveMarket,
+      expectedPortfolio: livePortfolio,
+      programOwnerMatches: true,
+    }),
+    create: async () => { creates += 1; },
+  });
+  assert.equal(creates, 0);
 });
 
 test("hosted keeper configuration fails closed without explicit RPC and signer", () => {
