@@ -35,7 +35,7 @@ export function linkedAbortController(parent: AbortSignal): {
   dispose(): void;
 } {
   const controller = new AbortController();
-  const abort = () => controller.abort();
+  const abort = () => controller.abort(parent.reason);
   parent.addEventListener("abort", abort, { once: true });
   if (parent.aborted) abort();
   return {
@@ -183,40 +183,168 @@ export function confirmationResultFromError(error: unknown): { value: { err: unk
 }
 
 export interface ConfirmationStrategy {
-  abortSignal?: AbortSignal;
   blockhash: string;
   lastValidBlockHeight: number;
   signature: string;
 }
 
 export interface ConfirmationConnection {
-  confirmTransaction(strategy: ConfirmationStrategy, commitment: "confirmed"): Promise<unknown>;
+  getSignatureStatus(signature: string): Promise<unknown>;
+  onSignature(
+    signature: string,
+    callback: (result: { err: unknown }, context: unknown) => void,
+    commitment: "confirmed",
+  ): number;
+  removeSignatureListener(subscriptionId: number): Promise<void>;
+  _onSubscriptionStateChange?(subscriptionId: number, callback: (state: string) => void): () => void;
 }
 
-/** Adapter around Connection.confirmTransaction. Its operation signal is both
- * handed to web3's confirmation subscription and exposed to fetch middleware
- * through the caller's RpcOperationSignalScope. */
+function isAbortError(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError");
+}
+
+class OwnedAbortError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AbortError";
+  }
+}
+
+function abortOwned(controller: AbortController, message: string): void {
+  if (!controller.signal.aborted) controller.abort(new OwnedAbortError(message));
+}
+
+function isOwnedAbort(error: unknown, signal: AbortSignal): boolean {
+  return signal.aborted && error === signal.reason && isAbortError(error);
+}
+
+function fallbackConfirmationResult(response: unknown): { context: unknown; value: { err: unknown } } | null {
+  if (!response || typeof response !== "object") return null;
+  const { context, value } = response as { context?: unknown; value?: unknown };
+  if (!value || typeof value !== "object" || !("err" in value)) return null;
+  const status = value as { confirmationStatus?: unknown; err: unknown };
+  if (status.err !== null) return { context, value: { err: status.err } };
+  // The keeper confirms at "confirmed"; a processed-only fallback cannot
+  // advance watchdog health or beat the websocket subscription.
+  if (status.confirmationStatus !== "confirmed" && status.confirmationStatus !== "finalized") return null;
+  return { context, value: { err: null } };
+}
+
+export function formatConfirmationFallbackError(error: unknown): string {
+  return `[confirmation fallback] ${safeErrorMessage(error).slice(0, 140)}`;
+}
+
+/**
+ * Own the same websocket subscription plus getSignatureStatus fallback shape
+ * used by web3, but retain and settle the fallback before releasing the tick.
+ * web3's internal fallback is detached from the promise it returns, so it
+ * cannot safely share an operation abort signal with the keeper.
+ */
 export async function confirmConnectionTransaction(input: {
   clock?: Pick<Clock, "clearTimeout" | "setTimeout">;
   connection: ConfirmationConnection;
   parentSignal: AbortSignal;
   runWithOperationSignal<T>(signal: AbortSignal, work: () => Promise<T>): Promise<T>;
-  strategy: Omit<ConfirmationStrategy, "abortSignal">;
+  reportUnexpectedFallbackError?: (message: string) => void;
+  strategy: ConfirmationStrategy;
   timeoutMs: number;
 }): Promise<unknown> {
   const linked = linkedAbortController(input.parentSignal);
   const confirmation = linked.controller;
   const clock = input.clock ?? systemClock;
-  const timeout = clock.setTimeout(() => confirmation.abort(), input.timeoutMs);
+  const timeout = clock.setTimeout(() => abortOwned(confirmation, "keeper transaction confirmation timed out"), input.timeoutMs);
   try {
-    return await input.runWithOperationSignal(confirmation.signal, () => input.connection.confirmTransaction(
-      { ...input.strategy, abortSignal: confirmation.signal },
-      "confirmed",
-    ));
+    return await input.runWithOperationSignal(confirmation.signal, async () => {
+      let subscriptionId: number | null = null;
+      let subscriptionDelivered = false;
+      let disposeSubscriptionStateObserver: (() => void) | undefined;
+      let fallbackStarted = false;
+      let settled = false;
+      let resolveOutcome!: (result: unknown) => void;
+      let rejectOutcome!: (error: unknown) => void;
+      const outcome = new Promise<unknown>((resolve, reject) => {
+        resolveOutcome = resolve;
+        rejectOutcome = reject;
+      });
+      const settle = (result: unknown, error?: unknown) => {
+        if (settled) return;
+        settled = true;
+        confirmation.signal.removeEventListener("abort", onAbort);
+        if (error !== undefined) rejectOutcome(error);
+        else resolveOutcome(result);
+      };
+      const onAbort = () => settle(undefined, confirmation.signal.reason ?? new Error("confirmation aborted"));
+      if (confirmation.signal.aborted) onAbort();
+      else confirmation.signal.addEventListener("abort", onAbort, { once: true });
+      let fallback: Promise<void> | null = null;
+      const startFallback = () => {
+        if (fallbackStarted || settled) return;
+        fallbackStarted = true;
+        fallback = (async () => {
+          try {
+            const response = await input.connection.getSignatureStatus(input.strategy.signature);
+            const result = fallbackConfirmationResult(response);
+            if (result) settle(result);
+          } catch (error) {
+            if (isOwnedAbort(error, confirmation.signal)) return;
+            if (settled) {
+              // A subscription already supplied the result. This late fallback
+              // error cannot change it, but must remain observable exactly once.
+              (input.reportUnexpectedFallbackError ?? console.error)(formatConfirmationFallbackError(error));
+            } else {
+              settle(undefined, error);
+            }
+          }
+        })();
+      };
+      try {
+        try {
+          subscriptionId = input.connection.onSignature(
+            input.strategy.signature,
+            (result, context) => {
+              // web3.js 1.98.4 auto-removes signature subscriptions after this
+              // callback returns; do not issue a second unsubscribe in cleanup.
+              subscriptionDelivered = true;
+              settle({ context, value: result });
+            },
+            "confirmed",
+          );
+        } catch (error) {
+          // No caller can await `outcome` if subscription registration itself
+          // fails, so leave it pending and propagate that original error.
+          settled = true;
+          confirmation.signal.removeEventListener("abort", onAbort);
+          throw error;
+        }
+        if (input.connection._onSubscriptionStateChange) {
+          disposeSubscriptionStateObserver = input.connection._onSubscriptionStateChange(subscriptionId, (state) => {
+            if (state === "subscribed") startFallback();
+          });
+        } else {
+          startFallback();
+        }
+        const result = await outcome;
+        return result;
+      } finally {
+        // Abort while the RPC operation scope is still active, then await the
+        // actual fallback promise. This leaves neither a detached rejection nor
+        // live HTTP work after a successful subscription confirmation.
+        abortOwned(confirmation, "keeper transaction confirmation completed");
+        disposeSubscriptionStateObserver?.();
+        if (subscriptionId !== null && !subscriptionDelivered) {
+          try {
+            await input.connection.removeSignatureListener(subscriptionId);
+          } catch (error) {
+            (input.reportUnexpectedFallbackError ?? console.error)(formatConfirmationFallbackError(error));
+          }
+        }
+        await fallback;
+      }
+    });
   } catch (error) {
     const normalized = confirmationResultFromError(error);
     if (normalized) return normalized;
-    if (confirmation.signal.aborted) {
+    if (isOwnedAbort(error, confirmation.signal)) {
       throw new KeeperFailure(
         input.parentSignal.aborted ? "cancelled" : "timeout",
         input.parentSignal.aborted
@@ -226,10 +354,8 @@ export async function confirmConnectionTransaction(input: {
     }
     throw error;
   } finally {
-    // Confirmation can resolve while web3's fallback HTTP/subscription work is
-    // still unwinding. Abort after capturing the outcome so every operation-
-    // lifetime poll is released on success, chain error, timeout, and shutdown.
-    confirmation.abort();
+    // Timeout/shutdown can enter before the owned fallback has started.
+    abortOwned(confirmation, "keeper transaction confirmation completed");
     clock.clearTimeout(timeout);
     linked.dispose();
   }

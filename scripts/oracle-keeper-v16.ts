@@ -176,13 +176,14 @@ async function sendIxs(
     maxRetries: 0,
   });
 
-  // The operation signal is used by both Connection.confirmTransaction and
-  // fetchMiddleware, so the 8s confirmation cap cancels subscription and HTTP
-  // fallback polls rather than merely releasing this caller.
+  // The owned confirmation helper retains and settles the status fallback
+  // before releasing this operation signal, so the 8s cap cancels both the
+  // subscription and its HTTP work without a detached web3 continuation.
   const result = await confirmConnectionTransaction({
     connection: conn,
     parentSignal: signal,
     runWithOperationSignal: (operationSignal, work) => rpcOperationSignals.run(operationSignal, work),
+    reportUnexpectedFallbackError: (message) => console.error(`  ${message}`),
     strategy: { signature: sig, blockhash, lastValidBlockHeight },
     timeoutMs: TX_TIMEOUT_MS,
   });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PublicKey } from "@solana/web3.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 import {
   abortableSleep,
   classifyKeeperError,
@@ -9,6 +9,7 @@ import {
   confirmationResultFromError,
   crankBufferSeedForMarket,
   ensureUsableCrankBuffer,
+  formatConfirmationFallbackError,
   formatUnhandledRejection,
   isUsableLeglessCrankBuffer,
   isCustomProgramError,
@@ -103,23 +104,25 @@ test("parent already aborted before confirmation linking aborts the child immedi
   linked.dispose();
 });
 
-test("Connection confirmation adapter recognizes direct and nested Custom 21 results on resolve and rejection", async () => {
-  for (const [mode, err] of [
-    ["resolve", { Custom: 21 }],
-    ["resolve", { InstructionError: [3, { Custom: 21 }] }],
-    ["reject", { Custom: 21 }],
-    ["reject", { InstructionError: [3, { Custom: 21 }] }],
+test("owned confirmation preserves direct and nested Custom 21 results from subscription and fallback", async () => {
+  for (const [source, err] of [
+    ["subscription", { Custom: 21 }],
+    ["subscription", { InstructionError: [3, { Custom: 21 }] }],
+    ["fallback", { Custom: 21 }],
+    ["fallback", { InstructionError: [3, { Custom: 21 }] }],
   ] as const) {
     const scope = new RpcOperationSignalScope();
     const result = await confirmConnectionTransaction({
       clock: fakeClock(),
       connection: {
-        confirmTransaction: async (strategy) => {
-          assert.equal(scope.currentSignal(), strategy.abortSignal, "middleware sees the confirmation lifetime signal");
-          const value = { value: { err } };
-          if (mode === "reject") throw Object.assign(new Error("fallback status"), value);
-          return value;
+        getSignatureStatus: async () => source === "fallback"
+          ? { context: { slot: 1 }, value: { err, confirmationStatus: "confirmed" } }
+          : { context: { slot: 1 }, value: null },
+        onSignature: (_signature, callback) => {
+          if (source === "subscription") queueMicrotask(() => callback({ err }, { slot: 1 }));
+          return 1;
         },
+        removeSignatureListener: async () => undefined,
       },
       parentSignal: new AbortController().signal,
       runWithOperationSignal: (signal, work) => scope.run(signal, work),
@@ -131,12 +134,14 @@ test("Connection confirmation adapter recognizes direct and nested Custom 21 res
   }
 });
 
-test("raw web3 InstructionError rejection becomes crank.err and enters the Custom 21 self-heal branch", async () => {
+test("raw subscription setup InstructionError becomes crank.err and enters the Custom 21 self-heal branch", async () => {
   const rawTransactionError = { InstructionError: [2, { Custom: 21 }] };
   const result = await confirmConnectionTransaction({
     clock: fakeClock(),
     connection: {
-      confirmTransaction: async () => { throw rawTransactionError; },
+      getSignatureStatus: async () => ({ context: { slot: 1 }, value: null }),
+      onSignature: () => { throw rawTransactionError; },
+      removeSignatureListener: async () => undefined,
     },
     parentSignal: new AbortController().signal,
     runWithOperationSignal: async (_signal, work) => work(),
@@ -154,7 +159,11 @@ test("only a validated raw Solana InstructionError is normalized", async () => {
   await assert.rejects(
     confirmConnectionTransaction({
       clock: fakeClock(),
-      connection: { confirmTransaction: async () => { throw untrusted; } },
+      connection: {
+        getSignatureStatus: async () => ({ context: { slot: 1 }, value: null }),
+        onSignature: () => { throw untrusted; },
+        removeSignatureListener: async () => undefined,
+      },
       parentSignal: new AbortController().signal,
       runWithOperationSignal: async (_signal, work) => work(),
       strategy: { signature: "sig", blockhash: "blockhash", lastValidBlockHeight: 1 },
@@ -165,18 +174,26 @@ test("only a validated raw Solana InstructionError is normalized", async () => {
   assert.equal(confirmationResultFromError({ InstructionError: [0, { Custom: 21, Other: 1 }] }), null);
 });
 
-test("confirmation finalization aborts all operation-lifetime calls on success and on-chain error", async () => {
+test("owned confirmation finalization aborts and settles all operation-lifetime fallback work", async () => {
   for (const err of [null, { InstructionError: [1, { Custom: 21 }] }]) {
     const scope = new RpcOperationSignalScope();
     let activeCalls = 0;
     const result = await confirmConnectionTransaction({
       clock: fakeClock(),
       connection: {
-        confirmTransaction: async (strategy) => {
-          activeCalls += 1; // simulated HTTP fallback/subscription task
-          strategy.abortSignal?.addEventListener("abort", () => { activeCalls -= 1; }, { once: true });
-          return { value: { err } };
+        getSignatureStatus: () => new Promise<unknown>((_resolve, reject) => {
+          activeCalls += 1;
+          const signal = scope.currentSignal();
+          signal?.addEventListener("abort", () => {
+            activeCalls -= 1;
+            reject(signal.reason);
+          }, { once: true });
+        }),
+        onSignature: (_signature, callback) => {
+          queueMicrotask(() => callback({ err }, { slot: 1 }));
+          return 1;
         },
+        removeSignatureListener: async () => undefined,
       },
       parentSignal: new AbortController().signal,
       runWithOperationSignal: (signal, work) => scope.run(signal, work),
@@ -189,23 +206,125 @@ test("confirmation finalization aborts all operation-lifetime calls on success a
   }
 });
 
-test("confirmation timeout and shutdown abort Connection work and middleware polls without orphaning a runner", async () => {
+async function runRealConnectionFallbackRace(kind: "owner" | "independent-abort" | "transport") {
+  const scope = new RpcOperationSignalScope();
+  let activeFallbacks = 0;
+  let unsubscribeCalls = 0;
+  const ignoredUnsubscribeWarnings: string[] = [];
+  let onSubscribed!: (state: string) => void;
+  let deliverSubscription!: (result: { err: unknown }, context: unknown) => void;
+  const customFetch: typeof fetch = (_url, init) => new Promise<Response>((_resolve, reject) => {
+    activeFallbacks += 1;
+    const signal = init?.signal;
+    signal?.addEventListener("abort", () => {
+      activeFallbacks -= 1;
+      if (kind === "owner") reject(signal.reason);
+      else if (kind === "independent-abort") {
+        reject(Object.assign(new Error("independent abort"), { name: "AbortError" }));
+      } else {
+        reject(new Error("connection reset https://provider.invalid/key"));
+      }
+    }, { once: true });
+  });
+  const connection = new Connection("http://127.0.0.1:8899", {
+    commitment: "confirmed",
+    fetch: customFetch,
+    fetchMiddleware: (url, options, next) => next(url, {
+      ...(options ?? {}),
+      signal: scope.currentSignal() ?? options?.signal,
+    }),
+  }) as unknown as {
+    _onSubscriptionStateChange: (id: number, callback: (state: string) => void) => () => void;
+    getSignatureStatus: (signature: string) => Promise<unknown>;
+    onSignature: (signature: string, callback: (result: { err: unknown }, context: unknown) => void, commitment: "confirmed") => number;
+    removeSignatureListener: (id: number) => Promise<void>;
+  };
+  connection.removeSignatureListener = async () => {
+    unsubscribeCalls += 1;
+    if (unsubscribeCalls > 1) ignoredUnsubscribeWarnings.push("ignored unsubscribe");
+  };
+  connection.onSignature = (_signature, callback) => {
+    deliverSubscription = (result, context) => {
+      callback(result, context);
+      // Mirrors web3.js 1.98.4's onSignature auto-removal after callback.
+      void connection.removeSignatureListener(7);
+    };
+    return 7;
+  };
+  connection._onSubscriptionStateChange = (_id, callback) => {
+    onSubscribed = callback;
+    return () => undefined;
+  };
+  const reports: string[] = [];
+  const unhandled: unknown[] = [];
+  const uncaught: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  const onUncaught = (error: unknown) => { uncaught.push(error); };
+  process.on("unhandledRejection", onUnhandled);
+  process.on("uncaughtException", onUncaught);
+  try {
+    const confirmation = confirmConnectionTransaction({
+      clock: fakeClock(),
+      connection,
+      parentSignal: new AbortController().signal,
+      reportUnexpectedFallbackError: (message) => { reports.push(message); },
+      runWithOperationSignal: (signal, work) => scope.run(signal, work),
+      strategy: { signature: "sig", blockhash: "blockhash", lastValidBlockHeight: 1 },
+      timeoutMs: 8_000,
+    });
+    await flush();
+    onSubscribed("subscribed");
+    await flush();
+    assert.equal(activeFallbacks, 1);
+    deliverSubscription({ err: null }, { slot: 1 });
+    assert.deepEqual(await confirmation, { context: { slot: 1 }, value: { err: null } });
+    await flush();
+    assert.equal(activeFallbacks, 0);
+    assert.equal(unsubscribeCalls, 1);
+    assert.deepEqual(ignoredUnsubscribeWarnings, []);
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(uncaught, []);
+    assert.equal(scope.currentSignal(), null);
+    return reports;
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+    process.removeListener("uncaughtException", onUncaught);
+  }
+}
+
+test("real Connection custom-fetch fallback consumes only its exact owner abort and avoids double unsubscribe", async () => {
+  assert.deepEqual(await runRealConnectionFallbackRace("owner"), []);
+});
+
+test("real Connection custom-fetch fallback reports independent abort and transport exactly once", async () => {
+  assert.deepEqual(
+    await runRealConnectionFallbackRace("independent-abort"),
+    [formatConfirmationFallbackError(Object.assign(new Error("independent abort"), { name: "AbortError" }))],
+  );
+  assert.deepEqual(
+    await runRealConnectionFallbackRace("transport"),
+    [formatConfirmationFallbackError(new Error("connection reset https://provider.invalid/key"))],
+  );
+});
+
+test("confirmation timeout and shutdown abort owned fallback work without orphaning a runner", async () => {
   const clock = fakeClock();
   const scope = new RpcOperationSignalScope();
   const runner = new SingleTickRunner(clock, 20_000);
   let unresolvedCalls = 0;
   const parent = new AbortController();
   const connection = {
-    confirmTransaction: (strategy: { abortSignal?: AbortSignal }) => new Promise<unknown>((_resolve, reject) => {
+    getSignatureStatus: () => new Promise<unknown>((_resolve, reject) => {
       unresolvedCalls += 1;
       const pollSignal = scope.currentSignal();
-      assert.equal(pollSignal, strategy.abortSignal);
       const onAbort = () => {
         unresolvedCalls -= 1;
-        reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        reject(pollSignal?.reason);
       };
-      strategy.abortSignal?.addEventListener("abort", onAbort, { once: true });
+      pollSignal?.addEventListener("abort", onAbort, { once: true });
     }),
+    onSignature: () => 1,
+    removeSignatureListener: async () => undefined,
   };
   const first = runner.run(async (signal) => {
     await confirmConnectionTransaction({
@@ -235,13 +354,15 @@ test("confirmation timeout and shutdown abort Connection work and middleware pol
   const pending = confirmConnectionTransaction({
     clock: shutdownClock,
     connection: {
-      confirmTransaction: (strategy) => new Promise<unknown>((_resolve, reject) => {
+      getSignatureStatus: () => new Promise<unknown>((_resolve, reject) => {
         shutdownCalls += 1;
-        strategy.abortSignal?.addEventListener("abort", () => {
+        shutdownScope.currentSignal()?.addEventListener("abort", () => {
           shutdownCalls -= 1;
-          reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+          reject(shutdownScope.currentSignal()?.reason);
         }, { once: true });
       }),
+      onSignature: () => 1,
+      removeSignatureListener: async () => undefined,
     },
     parentSignal: shutdown.signal,
     runWithOperationSignal: (operationSignal, work) => shutdownScope.run(operationSignal, work),
