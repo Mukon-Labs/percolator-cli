@@ -27,6 +27,7 @@ import {
   runDeadlineBoundOperation,
   runBoundedSelfHeal,
   safeErrorMessage,
+  scheduleForcedExit,
   SingleTickRunner,
   V16_LOSS_STALE_ACTIVE_OFFSET,
   type Clock,
@@ -691,6 +692,17 @@ test("terminal restart preserves its nonzero exit code when cancellation makes d
 
   assert.deepEqual(exits, [1]);
   assert.deepEqual(reports, [failure]);
+});
+
+test("forced watchdog exit remains live while a drain is stuck", () => {
+  const clock = fakeClock();
+  const exits: number[] = [];
+  const cancel = scheduleForcedExit({ clock, delayMs: 10_000, code: 1, exit: (code) => exits.push(code) });
+  assert.equal(clock.tasks.length, 1);
+  clock.tasks[0].callback();
+  assert.deepEqual(exits, [1]);
+  cancel();
+  assert.equal(clock.tasks[0].cancelled, true);
 });
 
 test("confirmation success, on-chain error, timeout, and cancellation remain distinct", () => {

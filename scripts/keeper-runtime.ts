@@ -390,6 +390,20 @@ export async function runDeadlineBoundOperation<T>(input: {
   }
 }
 
+/** Keep a supervisor-visible exit alive while an asynchronous drain is stuck.
+ * Promises alone do not keep Node's event loop alive, so a watchdog needs this
+ * timer to preserve its intended nonzero exit code. */
+export function scheduleForcedExit(input: {
+  clock?: Pick<Clock, "clearTimeout" | "setTimeout">;
+  delayMs: number;
+  code: number;
+  exit(code: number): void;
+}): () => void {
+  const clock = input.clock ?? systemClock;
+  const handle = clock.setTimeout(() => input.exit(input.code), input.delayMs);
+  return () => clock.clearTimeout(handle);
+}
+
 export interface CircuitState {
   failures: number;
   openUntilMs: number;

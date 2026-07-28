@@ -47,6 +47,7 @@ import {
   runBoundedSelfHeal,
   readV16LossStaleActive,
   safeErrorMessage,
+  scheduleForcedExit,
   SingleTickRunner,
   systemClock,
   retryAfterMs,
@@ -71,6 +72,7 @@ const PYTH_HERMES_URL = "https://hermes.pyth.network";
 const PUSH_INTERVAL_MS = 5000;
 const TICK_DEADLINE_MS = 20_000;   // hard cap on one tick, releases the guard
 const WATCHDOG_MS = 150_000;       // no successful push for this long -> exit(1)
+const WATCHDOG_FORCE_EXIT_MS = 10_000;
 const TX_TIMEOUT_MS = 8000;
 const MAX_BACKOFF_MS = 30_000;
 const MARKET_STATUS_CHECK_MS = 30_000;
@@ -258,13 +260,47 @@ async function selfHeal(pushed: number[], signal: AbortSignal): Promise<void> {
  * clears. A failed probe never suppresses price pushes; once a lock was seen,
  * continue bounded catch-up until the next successful status read.
  */
-async function marketNeedsCatchUp(): Promise<boolean> {
+async function fetchMarketLossStaleActive(signal: AbortSignal): Promise<boolean> {
+  const response = await fetch(RPC_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "keeper-market-status",
+      method: "getAccountInfo",
+      params: [MARKET.toBase58(), { commitment: "confirmed", encoding: "base64" }],
+    }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new KeeperFailure(
+      response.status === 429 ? "rate_limit" : "transport",
+      `market status HTTP ${response.status}`,
+      retryAfterMs(response.headers, Date.now()),
+    );
+  }
+  const payload: unknown = await response.json();
+  const encoded = (payload as { result?: { value?: { data?: unknown } } })?.result?.value?.data;
+  if (!Array.isArray(encoded) || typeof encoded[0] !== "string") {
+    throw new KeeperFailure("onchain", "v16 market status account is unavailable");
+  }
+  return readV16LossStaleActive(Buffer.from(encoded[0], "base64"));
+}
+
+async function marketNeedsCatchUp(parentSignal: AbortSignal): Promise<boolean> {
+  // Once a direct status read confirms a healthy market, Custom-21 remains the
+  // trigger for reopening this recovery probe. Avoid a recurring web3 account
+  // read in the ordinary push path.
+  if (marketStatusSettledHealthy) return false;
   const now = Date.now();
   if (now < nextMarketStatusCheckMs) return knownLossStaleActive;
   try {
-    const info = await conn.getAccountInfo(MARKET, "confirmed");
-    if (!info) throw new KeeperFailure("onchain", "v16 market status account is unavailable");
-    knownLossStaleActive = readV16LossStaleActive(info.data);
+    knownLossStaleActive = await runDeadlineBoundOperation({
+      parentSignal,
+      timeoutMs: 5_000,
+      work: fetchMarketLossStaleActive,
+    });
+    marketStatusSettledHealthy = !knownLossStaleActive;
     nextMarketStatusCheckMs = now + MARKET_STATUS_CHECK_MS;
   } catch (error) {
     nextMarketStatusCheckMs = now + MARKET_STATUS_CHECK_MS;
@@ -295,6 +331,7 @@ const lifecycle = new KeeperLifecycle(
 let watchdogSuppressedUntil = 0;
 let transientBackoffUntil = 0;
 let knownLossStaleActive = false;
+let marketStatusSettledHealthy = false;
 let nextMarketStatusCheckMs = 0;
 
 function stopKeeper(): void {
@@ -362,6 +399,8 @@ async function tickInner(signal: AbortSignal) {
     const isLossStale = isCustomProgramError(crank.err, 21);
     console.log(`  [${time}] ${parts.join("  ")} push ✓, crank rejected${isLossStale ? " -> self-heal" : ""}`);
     if (isLossStale && !healing) {
+      knownLossStaleActive = true;
+      marketStatusSettledHealthy = false;
       healing = true;
       try { await selfHeal(pushed, signal); } finally { healing = false; }
     }
@@ -370,7 +409,7 @@ async function tickInner(signal: AbortSignal) {
     // A normal LP crank can succeed without catching every asset clock up
     // after a keeper outage. While the market's loss-stale lock is active,
     // continue the existing bounded legless-buffer path proactively.
-    if (await marketNeedsCatchUp()) {
+    if (await marketNeedsCatchUp(signal)) {
       if (!healing) {
         healing = true;
         try {
@@ -413,12 +452,17 @@ lifecycle.every(() => {
   if (Date.now() < watchdogSuppressedUntil) return;
   if (watchdog.shouldRestart(Date.now(), WATCHDOG_MS)) {
     console.error(`WATCHDOG: no successful push for ${WATCHDOG_MS / 1000}s — exiting for restart`);
+    const cancelForcedExit = scheduleForcedExit({
+      delayMs: WATCHDOG_FORCE_EXIT_MS,
+      code: 1,
+      exit: (code) => process.exit(code),
+    });
     void lifecycle.terminate(async () => {
       shutdown.abort();
       tickRunner.abortActive();
       bootRunner.abortActive();
       await Promise.all([tickRunner.drain(), bootRunner.drain()]);
-    }, 1);
+    }, 1).finally(cancelForcedExit);
   }
 }, 15_000);
 
