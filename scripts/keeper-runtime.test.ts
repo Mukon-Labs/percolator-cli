@@ -671,6 +671,26 @@ test("terminal shutdown clears intervals and exits only after active work drains
   assert.deepEqual(exits, [0]);
 });
 
+test("terminal restart preserves its nonzero exit code when cancellation makes drain reject", async () => {
+  const scheduler: IntervalScheduler = {
+    setInterval: (() => ({}) as ReturnType<typeof setInterval>),
+    clearInterval: () => {},
+  };
+  const exits: number[] = [];
+  const reports: unknown[] = [];
+  const lifecycle = new KeeperLifecycle(
+    scheduler,
+    (code) => exits.push(code),
+    (error) => reports.push(error),
+  );
+
+  const failure = new Error('operation cancelled during shutdown');
+  await lifecycle.terminate(async () => { throw failure; }, 1);
+
+  assert.deepEqual(exits, [1]);
+  assert.deepEqual(reports, [failure]);
+});
+
 test("confirmation success, on-chain error, timeout, and cancellation remain distinct", () => {
   assert.equal(confirmedTransactionError({ value: { err: null } }), null);
   assert.deepEqual(confirmedTransactionError({ value: { err: { Custom: 21 } } }), { Custom: 21 });

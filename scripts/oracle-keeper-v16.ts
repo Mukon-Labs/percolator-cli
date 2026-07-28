@@ -263,7 +263,11 @@ const tickRunner = new SingleTickRunner(systemClock, TICK_DEADLINE_MS);
 const bootRunner = new SingleTickRunner(systemClock, TICK_DEADLINE_MS);
 const watchdog = new PushWatchdog(Date.now());
 const shutdown = new AbortController();
-const lifecycle = new KeeperLifecycle({ clearInterval, setInterval }, (code) => process.exit(code));
+const lifecycle = new KeeperLifecycle(
+  { clearInterval, setInterval },
+  (code) => process.exit(code),
+  (error) => console.error(`  keeper shutdown drain failed: ${safeErrorMessage(error)}`),
+);
 let watchdogSuppressedUntil = 0;
 let transientBackoffUntil = 0;
 

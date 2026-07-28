@@ -744,6 +744,7 @@ export class KeeperLifecycle {
   constructor(
     private readonly scheduler: IntervalScheduler,
     private readonly exit: (code: number) => void,
+    private readonly reportDrainFailure: (error: unknown) => void = () => {},
   ) {}
 
   isTerminal(): boolean {
@@ -764,8 +765,15 @@ export class KeeperLifecycle {
     for (const handle of this.intervals) this.scheduler.clearInterval(handle);
     this.intervals.clear();
     this.termination = (async () => {
-      await drain();
-      this.exit(code);
+      try {
+        await drain();
+      } catch (error) {
+        // A cancellation-aware drain can reject while unwinding in-flight RPC
+        // work. The terminal exit code must still reach the supervisor.
+        this.reportDrainFailure(error);
+      } finally {
+        this.exit(code);
+      }
     })();
     return this.termination;
   }
