@@ -779,6 +779,24 @@ export class KeeperLifecycle {
   }
 }
 
+/**
+ * Layout-stable v16 market flag used only to decide whether the keeper should
+ * run its existing legless-buffer catch-up path. The market account is
+ * [header 16][wrapper config 448][market-group header]; loss_stale_active is
+ * byte 591 in that header.
+ */
+export const V16_LOSS_STALE_ACTIVE_OFFSET = 16 + 448 + 591;
+
+export function readV16LossStaleActive(marketData: Uint8Array): boolean {
+  if (marketData.length <= V16_LOSS_STALE_ACTIVE_OFFSET) {
+    throw new KeeperFailure("onchain", "v16 market status layout is unavailable");
+  }
+  const value = marketData[V16_LOSS_STALE_ACTIVE_OFFSET];
+  if (value === 0) return false;
+  if (value === 1) return true;
+  throw new KeeperFailure("onchain", "v16 market loss-stale flag is invalid");
+}
+
 export class PushWatchdog {
   private lastConfirmedPushMs: number | null = null;
 

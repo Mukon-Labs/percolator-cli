@@ -19,6 +19,7 @@ import {
   modelCatchupCadence,
   parseKeeperSecretKey,
   PushWatchdog,
+  readV16LossStaleActive,
   requireConfiguredHermesFeeds,
   requireKeeperConfiguration,
   RpcCircuitBreaker,
@@ -27,6 +28,7 @@ import {
   runBoundedSelfHeal,
   safeErrorMessage,
   SingleTickRunner,
+  V16_LOSS_STALE_ACTIVE_OFFSET,
   type Clock,
   type IntervalScheduler,
 } from "./keeper-runtime.ts";
@@ -709,6 +711,19 @@ test("watchdog never advances on timeout or cancellation, only confirmed pushes"
   watchdog.recordConfirmedPush(160_000, true);
   assert.equal(watchdog.lastSuccessMs(), 160_000);
   assert.equal(watchdog.shouldRestart(300_000, 150_000), false);
+});
+
+test("v16 loss-stale parser accepts only the exact on-chain boolean encoding", () => {
+  const data = new Uint8Array(V16_LOSS_STALE_ACTIVE_OFFSET + 1);
+  assert.equal(readV16LossStaleActive(data), false);
+  data[V16_LOSS_STALE_ACTIVE_OFFSET] = 1;
+  assert.equal(readV16LossStaleActive(data), true);
+  data[V16_LOSS_STALE_ACTIVE_OFFSET] = 2;
+  assert.throws(() => readV16LossStaleActive(data), /loss-stale flag/);
+  assert.throws(
+    () => readV16LossStaleActive(new Uint8Array(V16_LOSS_STALE_ACTIVE_OFFSET)),
+    /status layout/,
+  );
 });
 
 test("sanitizers redact HTTP/WSS URLs, authorization/api-key forms, and unhandled rejections", () => {

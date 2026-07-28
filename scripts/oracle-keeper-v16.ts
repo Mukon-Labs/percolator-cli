@@ -45,6 +45,7 @@ import {
   requireKeeperConfiguration,
   runDeadlineBoundOperation,
   runBoundedSelfHeal,
+  readV16LossStaleActive,
   safeErrorMessage,
   SingleTickRunner,
   systemClock,
@@ -72,6 +73,7 @@ const TICK_DEADLINE_MS = 20_000;   // hard cap on one tick, releases the guard
 const WATCHDOG_MS = 150_000;       // no successful push for this long -> exit(1)
 const TX_TIMEOUT_MS = 8000;
 const MAX_BACKOFF_MS = 30_000;
+const MARKET_STATUS_CHECK_MS = 30_000;
 const PORTFOLIO_ACCOUNT_LEN = 9411;
 const CATCHUP_TXS_PER_TICK = 4;    // self-heal budget per tick (~180 slots each)
 const CATCHUP_CRANKS_PER_TX = 9;
@@ -249,6 +251,28 @@ async function selfHeal(pushed: number[], signal: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * A stale lock can persist even when the ordinary LP crank confirms: that
+ * crank may settle the LP but not advance every stale asset clock. Probe at a
+ * bounded cadence and use the existing legless buffer until the on-chain lock
+ * clears. A failed probe never suppresses price pushes; once a lock was seen,
+ * continue bounded catch-up until the next successful status read.
+ */
+async function marketNeedsCatchUp(): Promise<boolean> {
+  const now = Date.now();
+  if (now < nextMarketStatusCheckMs) return knownLossStaleActive;
+  try {
+    const info = await conn.getAccountInfo(MARKET, "confirmed");
+    if (!info) throw new KeeperFailure("onchain", "v16 market status account is unavailable");
+    knownLossStaleActive = readV16LossStaleActive(info.data);
+    nextMarketStatusCheckMs = now + MARKET_STATUS_CHECK_MS;
+  } catch (error) {
+    nextMarketStatusCheckMs = now + MARKET_STATUS_CHECK_MS;
+    console.error(`  market recovery status unavailable: ${safeErrorMessage(error)}`);
+  }
+  return knownLossStaleActive;
+}
+
 console.log("Oracle Keeper (v16, hardened v2) started");
 console.log(`  Program: ${PROGRAM_ID.toBase58()}`);
 console.log(`  Market:  ${MARKET.toBase58()}`);
@@ -270,6 +294,8 @@ const lifecycle = new KeeperLifecycle(
 );
 let watchdogSuppressedUntil = 0;
 let transientBackoffUntil = 0;
+let knownLossStaleActive = false;
+let nextMarketStatusCheckMs = 0;
 
 function stopKeeper(): void {
   if (lifecycle.isTerminal()) return;
@@ -341,6 +367,20 @@ async function tickInner(signal: AbortSignal) {
     }
   } else {
     console.log(`  [${time}] ${parts.join("  ")} push+crank ✓ ${crank.sig.slice(0, 8)}…`);
+    // A normal LP crank can succeed without catching every asset clock up
+    // after a keeper outage. While the market's loss-stale lock is active,
+    // continue the existing bounded legless-buffer path proactively.
+    if (await marketNeedsCatchUp()) {
+      if (!healing) {
+        healing = true;
+        try {
+          console.log("  loss-stale lock active -> self-heal");
+          await selfHeal(pushed, signal);
+        } finally {
+          healing = false;
+        }
+      }
+    }
   }
   consecutiveErrors = 0;
 }
