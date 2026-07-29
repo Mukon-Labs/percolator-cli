@@ -15,6 +15,7 @@
     "start": "tsx scripts/oracle-keeper-v16.ts",
     "keeper": "tsx scripts/oracle-keeper-v16.ts",
     "test:keeper-runtime": "tsx scripts/keeper-runtime.test.ts",
+    "test:fund-lp": "tsx scripts/fund-current-market-lp.test.ts",
     "test": "tsx test/abi.test.ts && tsx test/pda.test.ts && tsx test/slab.test.ts && tsx test/validation.test.ts && tsx test/oracle.test.ts"
   },
   "dependencies": {
