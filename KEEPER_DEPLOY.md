@@ -79,6 +79,19 @@ should show ticks like:
 
 Fly restarts the machine if the process exits. The keeper owns bounded retry,
 confirmation timeout/cancellation, and rate-limit circuit behavior.
+At startup, every five minutes, and after a crank rejection, it also reports
+token custody, the separately accounted market vault, aggregate capital,
+insurance, matcher-LP capital/PnL, conservative risk equity, and its current
+margin certificate. `LP HEALTH CRITICAL` identifies depleted matcher capital or
+maintenance failure; it does not perform or recommend an automatic top-up.
+The same snapshot is available without a signer or keeper process:
+
+```bash
+npm run check:v16-health
+```
+
+That command is read-only, uses `RPC_URL`, and exits with status 2 for a
+critical/invalid snapshot.
 Direct Hermes HTTP responses can expose `Retry-After`; web3 RPC errors often do
 not retain response headers, so those failures use the bounded exponential
 fallback. When a header is available, it is honored up to a 15-minute maximum;
@@ -90,7 +103,8 @@ See `.env.example`. `RPC_URL` must be a dedicated keeper endpoint and
 `KEEPER_SECRET_KEY` must be the existing oracle-authority signer (not LP,
 upgrade, browser, or mint-authority material). Both are required. Optional
 `PROGRAM_ID`, `MARKET`, and `LP_PORTFOLIO` overrides must match the intended
-v16 deployment.
+v16 deployment. `LP_MIN_CAPITAL_USDC` controls the warning floor only and
+defaults to 10,000 test USDC.
 
 ## Local dev
 

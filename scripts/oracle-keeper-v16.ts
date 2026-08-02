@@ -25,6 +25,7 @@ import {
   Connection, Keypair, PublicKey, SystemProgram, Transaction,
   TransactionInstruction, ComputeBudgetProgram,
 } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import {
   abortableSleep,
   classifyKeeperError,
@@ -52,6 +53,13 @@ import {
   systemClock,
   retryAfterMs,
 } from "./keeper-runtime.ts";
+import {
+  assessV16MarketHealth,
+  formatV16MarketHealth,
+  parseUsdcFloor,
+  readV16MarketCollateralMint,
+  readV16MarketHealthSnapshot,
+} from "./v16-market-health.ts";
 
 const keeperConfiguration = requireKeeperConfiguration(process.env);
 const RPC_URL = keeperConfiguration.rpcUrl;
@@ -76,6 +84,9 @@ const WATCHDOG_FORCE_EXIT_MS = 10_000;
 const TX_TIMEOUT_MS = 8000;
 const MAX_BACKOFF_MS = 30_000;
 const MARKET_STATUS_CHECK_MS = 30_000;
+const LP_HEALTH_CHECK_MS = 5 * 60_000;
+const LP_FAILURE_HEALTH_CHECK_MS = 60_000;
+const LP_MIN_CAPITAL = parseUsdcFloor(process.env.LP_MIN_CAPITAL_USDC);
 const PORTFOLIO_ACCOUNT_LEN = 9411;
 const CATCHUP_TXS_PER_TICK = 4;    // self-heal budget per tick (~180 slots each)
 const CATCHUP_CRANKS_PER_TX = 9;
@@ -309,6 +320,57 @@ async function marketNeedsCatchUp(parentSignal: AbortSignal): Promise<boolean> {
   return knownLossStaleActive;
 }
 
+async function readLpHealth() {
+  const [marketInfo, lpInfo] = await conn.getMultipleAccountsInfo(
+    [MARKET, LP_PORTFOLIO],
+    "confirmed",
+  );
+  if (!marketInfo || !marketInfo.owner.equals(PROGRAM_ID)) {
+    throw new KeeperFailure("onchain", "configured v16 market account is unavailable");
+  }
+  if (!lpInfo || !lpInfo.owner.equals(PROGRAM_ID)) {
+    throw new KeeperFailure("onchain", "configured matcher LP portfolio is unavailable");
+  }
+  const marketData = Buffer.from(marketInfo.data);
+  const collateralMint = new PublicKey(readV16MarketCollateralMint(marketData, MARKET.toBytes()));
+  const vaultAuthority = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault"), MARKET.toBuffer()],
+    PROGRAM_ID,
+  )[0];
+  const vaultAta = getAssociatedTokenAddressSync(collateralMint, vaultAuthority, true);
+  const custodyBalance = BigInt((await conn.getTokenAccountBalance(vaultAta, "confirmed")).value.amount);
+  return assessV16MarketHealth(readV16MarketHealthSnapshot({
+    custodyBalance,
+    expectedLpPortfolio: LP_PORTFOLIO.toBytes(),
+    expectedMarket: MARKET.toBytes(),
+    lpData: Buffer.from(lpInfo.data),
+    marketData,
+  }), LP_MIN_CAPITAL);
+}
+
+async function reportLpHealth(
+  context: "startup" | "periodic" | "crank rejected",
+  signal: AbortSignal,
+): Promise<void> {
+  const now = Date.now();
+  if (context === "crank rejected") {
+    if (now < nextLpFailureHealthCheckMs) return;
+    nextLpFailureHealthCheckMs = now + LP_FAILURE_HEALTH_CHECK_MS;
+  } else {
+    if (context !== "startup" && now < nextLpHealthCheckMs) return;
+    nextLpHealthCheckMs = now + LP_HEALTH_CHECK_MS;
+  }
+  try {
+    const assessment = await readLpHealth();
+    const message = `  [${context}] ${formatV16MarketHealth(assessment)}`;
+    if (assessment.level === "healthy") console.log(message);
+    else console.error(message);
+  } catch (error) {
+    if (signal.aborted) throw error;
+    console.error(`  [${context}] LP health unavailable: ${safeErrorMessage(error)}`);
+  }
+}
+
 console.log("Oracle Keeper (v16, hardened v2) started");
 console.log(`  Program: ${PROGRAM_ID.toBase58()}`);
 console.log(`  Market:  ${MARKET.toBase58()}`);
@@ -333,6 +395,8 @@ let transientBackoffUntil = 0;
 let knownLossStaleActive = false;
 let marketStatusSettledHealthy = false;
 let nextMarketStatusCheckMs = 0;
+let nextLpHealthCheckMs = 0;
+let nextLpFailureHealthCheckMs = 0;
 
 function stopKeeper(): void {
   if (lifecycle.isTerminal()) return;
@@ -398,6 +462,7 @@ async function tickInner(signal: AbortSignal) {
   if (crank.err) {
     const isLossStale = isCustomProgramError(crank.err, 21);
     console.log(`  [${time}] ${parts.join("  ")} push ✓, crank rejected${isLossStale ? " -> self-heal" : ""}`);
+    await reportLpHealth("crank rejected", signal);
     if (isLossStale && !healing) {
       knownLossStaleActive = true;
       marketStatusSettledHealthy = false;
@@ -406,6 +471,7 @@ async function tickInner(signal: AbortSignal) {
     }
   } else {
     console.log(`  [${time}] ${parts.join("  ")} push+crank ✓ ${crank.sig.slice(0, 8)}…`);
+    await reportLpHealth("periodic", signal);
     // A normal LP crank can succeed without catching every asset clock up
     // after a keeper outage. While the market's loss-stale lock is active,
     // continue the existing bounded legless-buffer path proactively.
@@ -474,7 +540,10 @@ async function boot(): Promise<void> {
   for (;;) {
     try {
       if (shutdown.signal.aborted) throw new KeeperFailure("cancelled", "keeper shutdown requested");
-      await bootRunner.run((signal) => withRpcSignal(signal, () => ensureCrankBuffer(signal)));
+      await bootRunner.run((signal) => withRpcSignal(signal, async () => {
+        await ensureCrankBuffer(signal);
+        await reportLpHealth("startup", signal);
+      }));
       break;
     } catch (error) {
       const failure = classifyKeeperError(error);
