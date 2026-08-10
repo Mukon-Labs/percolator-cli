@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "auditedAt": "2026-08-10",
+  "repositories": [
+    {
+      "name": "percolator-engine",
+      "relativePath": "percolator",
+      "upstreamRef": "upstream/master",
+      "auditedUpstreamSha": "143e68c4917ed0400a27b952f036a5677047cd84",
+      "policy": "upstream-ancestor-plus-local-fixes",
+      "requiredAncestorOf": "d7d622eb2344c31bcc4cfca700e9d52d609298c6"
+    },
+    {
+      "name": "percolator-program",
+      "relativePath": "percolator-prog",
+      "upstreamRef": "upstream/main",
+      "auditedUpstreamSha": "36fa587e1424a8c7fdde2c701c10938188a51876",
+      "policy": "selective-port-with-layout-review"
+    },
+    {
+      "name": "percolator-cli",
+      "relativePath": "percolator-cli",
+      "upstreamRef": "upstream/master",
+      "auditedUpstreamSha": "7f9004768e5f6cbc4fb8c08fc1e5a8751669d990",
+      "policy": "disconnected-history-selective-port"
+    }
+  ],
+  "watchedCandidateRefs": [
+    {
+      "name": "engine-pr135-integration-candidate",
+      "relativePath": "percolator",
+      "upstreamRef": "upstream/codex/pr135-engine-integration-20260805",
+      "auditedUpstreamSha": "9ffc4749a4b7e486f814090c7b43fb01a6df5dcf",
+      "policy": "monitor-unmerged-candidate",
+      "decision": "separate-engine-upgrade-review",
+      "reason": "This unmerged integration branch is 29 non-merge commits beyond upstream master and changes recovery, ADL residue, source-lien and auto-crank semantics. It is too broad to import as part of a wrapper-only sync."
+    },
+    {
+      "name": "engine-flat-negative-crank-candidate",
+      "relativePath": "percolator",
+      "upstreamRef": "upstream/codex/fix-flat-negative-trade-crank-20260808",
+      "auditedUpstreamSha": "94abbd2401b2f151243965c625db4ef39c0f513b",
+      "policy": "monitor-unmerged-candidate",
+      "decision": "separate-engine-upgrade-review",
+      "pullRequest": "https://github.com/aeyakovenko/percolator/pull/174",
+      "reason": "This open PR is stacked on the unmerged integration branch, not master, and changes flat residual auto-crank and bankruptcy scoping. Review it with the full integration stack."
+    }
+  ],
+  "programDecisions": [
+    {
+      "upstreamSha": "c8cf4de81951535bc0749bd4b284ad4c8e7d056c",
+      "decision": "port",
+      "reason": "Clamp EWMA movement and batch fee attribution to fees actually collected; no account-layout change."
+    },
+    {
+      "upstreamSha": "567c76c99b117939685269c103b34a5e49284b77",
+      "decision": "adapted-not-cherry-picked",
+      "reason": "Mukon already binds orders to market and portfolio incarnation IDs in the existing matcher-config tail. The upstream implementation grows portfolio accounts by eight bytes and therefore needs a separate live-account migration review."
+    },
+    {
+      "upstreamSha": "da64be6",
+      "decision": "not-applicable",
+      "reason": "Documentation-only loop-invariant clarification."
+    },
+    {
+      "upstreamSha": "36fa587",
+      "decision": "not-applicable",
+      "reason": "Documentation-only loop-invariant clarification."
+    }
+  ]
+}

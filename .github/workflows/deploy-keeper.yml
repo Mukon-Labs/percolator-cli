@@ -1,0 +1,82 @@
+name: Deploy oracle keeper (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: Confirm the Fly application
+        required: true
+        type: choice
+        options:
+          - ninja-oracle-keeper
+      machine_id:
+        description: Existing singleton Fly machine ID
+        required: true
+        type: string
+      confirmation:
+        description: Type DEPLOY to authorize this release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fly-release-ninja-oracle-keeper
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Verify and deploy existing keeper
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Check explicit confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: test "$CONFIRMATION" = "DEPLOY"
+
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run release checks
+        run: |
+          npm run build
+          npm test
+          npm run test:keeper-runtime
+          npm run test:v16-health
+          node --test scripts/verify-fly-singleton.test.mjs
+
+      - name: Install Fly CLI
+        uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+        with:
+          version: 0.4.77
+
+      - name: Verify the hosted singleton
+        env:
+          EXPECTED_APP: ${{ inputs.app }}
+          EXPECTED_MACHINE_ID: ${{ inputs.machine_id }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          flyctl status --app "$EXPECTED_APP" --json \
+            | node scripts/verify-fly-singleton.mjs "$EXPECTED_APP" "$EXPECTED_MACHINE_ID"
+
+      - name: Deploy only the verified machine
+        env:
+          EXPECTED_APP: ${{ inputs.app }}
+          EXPECTED_MACHINE_ID: ${{ inputs.machine_id }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl deploy \
+            --app "$EXPECTED_APP" \
+            --ha=false \
+            --update-only \
+            --only-machines "$EXPECTED_MACHINE_ID" \
+            --strategy immediate \
+            --remote-only \
+            --yes
