@@ -54,6 +54,16 @@ import {
   retryAfterMs,
 } from "./keeper-runtime.ts";
 import {
+  AssetQuarantine,
+  BoundedShadowDecisionLog,
+  executeKeeperPlan,
+  FileDecisionSink,
+  isolateRejectedAssets,
+  keeperModeFromEnv,
+  recordSuccessfulShadowDecision,
+  type KeeperAction,
+} from "./keeper-shadow.ts";
+import {
   assessV16MarketHealth,
   formatV16MarketHealth,
   parseUsdcFloor,
@@ -61,7 +71,11 @@ import {
   readV16MarketHealthSnapshot,
 } from "./v16-market-health.ts";
 
-const keeperConfiguration = requireKeeperConfiguration(process.env);
+const keeperConfiguration = requireKeeperConfiguration(process.env as {
+  RPC_URL?: string;
+  KEEPER_SECRET_KEY?: string;
+});
+const KEEPER_MODE = keeperModeFromEnv(process.env);
 const RPC_URL = keeperConfiguration.rpcUrl;
 const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID ?? "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq"
@@ -90,6 +104,13 @@ const LP_MIN_CAPITAL = parseUsdcFloor(process.env.LP_MIN_CAPITAL_USDC);
 const PORTFOLIO_ACCOUNT_LEN = 9411;
 const CATCHUP_TXS_PER_TICK = 4;    // self-heal budget per tick (~180 slots each)
 const CATCHUP_CRANKS_PER_TX = 9;
+const SHADOW_DECISION_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const shadowDecisionLog = KEEPER_MODE === "shadow"
+  ? new BoundedShadowDecisionLog(
+    new FileDecisionSink(process.env.SHADOW_DECISION_LOG_PATH ?? "/tmp/ninja-keeper-shadow.jsonl"),
+    SHADOW_DECISION_LOG_MAX_BYTES,
+  )
+  : null;
 
 function loadKeypair(): Keypair {
   try {
@@ -114,6 +135,7 @@ const conn = new Connection(RPC_URL, {
 });
 const payer = loadKeypair();
 let crankBuffer: PublicKey; // legless portfolio used only for catch-up cranks
+let shadowCrankBufferUsable = false;
 
 // PushAuthMark (tag 63): [63, asset_index:u16, now_slot:u64, mark_e6:u64]
 function ixPushAuthMark(assetIndex: number, nowSlot: bigint, markE6: bigint): TransactionInstruction {
@@ -175,10 +197,73 @@ async function sendIxs(
   ixs: TransactionInstruction[],
   cuLimit: number,
   signal: AbortSignal,
-): Promise<{ sig: string; err: unknown | null }> {
+  intent?: { action: KeeperAction; assetIndexes: readonly number[]; observedSlot: bigint },
+): Promise<{ sig: string; err: unknown | null; confirmed: boolean }> {
   if (signal.aborted) throw new Error("keeper operation cancelled");
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
   if (signal.aborted) throw new Error("keeper operation cancelled");
+  const tx = new Transaction();
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = payer.publicKey;
+  const plannedIxs = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }),
+    ComputeBudgetProgram.requestHeapFrame({ bytes: 256 * 1024 }),
+    ...ixs,
+  ];
+  tx.add(...plannedIxs);
+  tx.sign(payer);
+
+  if (KEEPER_MODE === "shadow" && (!intent || !shadowDecisionLog)) {
+    throw new KeeperFailure("unknown", "shadow keeper send intent is missing");
+  }
+  const execution = await executeKeeperPlan({
+    mode: KEEPER_MODE,
+    simulate: async () => (await conn.simulateTransaction(tx)).value.err ?? null,
+    onShadowAccepted: async () => recordSuccessfulShadowDecision({
+      simulationError: null,
+      log: shadowDecisionLog!,
+      decision: {
+        action: intent!.action,
+        assetIndexes: intent!.assetIndexes,
+        createdAt: new Date().toISOString(),
+        instructions: plannedIxs,
+        market: MARKET.toBase58(),
+        observedSlot: intent!.observedSlot,
+        payer: payer.publicKey.toBase58(),
+      },
+    }),
+    broadcast: async () => {
+      const sig = await conn.sendRawTransaction(tx.serialize(), {
+        skipPreflight: true,
+        maxRetries: 0,
+      });
+      // Confirmation owns and settles all fallback work before this tick can
+      // release its single-flight signal.
+      const result = await confirmConnectionTransaction({
+        connection: conn,
+        parentSignal: signal,
+        runWithOperationSignal: (operationSignal, work) => rpcOperationSignals.run(operationSignal, work),
+        reportUnexpectedFallbackError: (message) => console.error(`  ${message}`),
+        strategy: { signature: sig, blockhash, lastValidBlockHeight },
+        timeoutMs: TX_TIMEOUT_MS,
+      });
+      return { sig, err: confirmedTransactionError(result), confirmed: true };
+    },
+  });
+  if (execution.mode === "live") return execution.value;
+  if (execution.simulationError !== null || !execution.value) {
+    return { sig: "shadow_rejected", err: execution.simulationError, confirmed: false };
+  }
+  return { sig: `shadow_${execution.value.decisionId.slice(0, 16)}`, err: null, confirmed: false };
+}
+
+async function simulateIxs(
+  ixs: TransactionInstruction[],
+  cuLimit: number,
+  signal: AbortSignal,
+): Promise<unknown | null> {
+  if (signal.aborted) throw new KeeperFailure("cancelled", "keeper simulation cancelled");
+  const { blockhash } = await conn.getLatestBlockhash("confirmed");
   const tx = new Transaction();
   tx.recentBlockhash = blockhash;
   tx.feePayer = payer.publicKey;
@@ -186,23 +271,8 @@ async function sendIxs(
   tx.add(ComputeBudgetProgram.requestHeapFrame({ bytes: 256 * 1024 }));
   tx.add(...ixs);
   tx.sign(payer);
-  const sig = await conn.sendRawTransaction(tx.serialize(), {
-    skipPreflight: true,
-    maxRetries: 0,
-  });
-
-  // The owned confirmation helper retains and settles the status fallback
-  // before releasing this operation signal, so the 8s cap cancels both the
-  // subscription and its HTTP work without a detached web3 continuation.
-  const result = await confirmConnectionTransaction({
-    connection: conn,
-    parentSignal: signal,
-    runWithOperationSignal: (operationSignal, work) => rpcOperationSignals.run(operationSignal, work),
-    reportUnexpectedFallbackError: (message) => console.error(`  ${message}`),
-    strategy: { signature: sig, blockhash, lastValidBlockHeight },
-    timeoutMs: TX_TIMEOUT_MS,
-  });
-  return { sig, err: confirmedTransactionError(result) };
+  const simulation = await conn.simulateTransaction(tx);
+  return simulation.value.err ?? null;
 }
 
 /** Ensure the legless crank-buffer portfolio exists (created once, ~0.066 SOL rent). */
@@ -220,6 +290,12 @@ async function ensureCrankBuffer(signal: AbortSignal): Promise<void> {
       expectedPortfolio: crankBuffer.toBytes(),
       programOwnerMatches: info.owner.equals(PROGRAM_ID),
     });
+  if (KEEPER_MODE === "shadow") {
+    const existing = await conn.getAccountInfo(crankBuffer, "confirmed");
+    shadowCrankBufferUsable = isUsableBuffer(existing);
+    console.log(`  shadow crank buffer: ${shadowCrankBufferUsable ? "usable" : "unavailable (self-heal simulation disabled)"}`);
+    return;
+  }
   const rent = await conn.getMinimumBalanceForRentExemption(PORTFOLIO_ACCOUNT_LEN);
   const initData = Buffer.from([1]); // InitPortfolio (tag 1)
   await ensureUsableCrankBuffer({
@@ -241,7 +317,11 @@ async function ensureCrankBuffer(signal: AbortSignal): Promise<void> {
           ],
           data: initData,
         }),
-      ], 200_000, signal);
+      ], 200_000, signal, {
+        action: "loss-stale-heal",
+        assetIndexes: [],
+        observedSlot: BigInt(await conn.getSlot("confirmed")),
+      });
       if (err) throw new KeeperFailure("onchain", "crank buffer create rejected on-chain");
     },
   });
@@ -250,6 +330,10 @@ async function ensureCrankBuffer(signal: AbortSignal): Promise<void> {
 
 /** Loss-stale self-heal: advance asset clocks via the legless buffer. */
 async function selfHeal(pushed: number[], signal: AbortSignal): Promise<void> {
+  if (KEEPER_MODE === "shadow" && !shadowCrankBufferUsable) {
+    console.error("  shadow self-heal skipped: crank buffer is unavailable");
+    return;
+  }
   await runBoundedSelfHeal({
     batchesPerTick: CATCHUP_TXS_PER_TICK,
     cranksPerBatch: CATCHUP_CRANKS_PER_TX,
@@ -257,7 +341,11 @@ async function selfHeal(pushed: number[], signal: AbortSignal): Promise<void> {
     runBatch: async (cranksPerBatch) => {
       const nowSlot = BigInt(await conn.getSlot("confirmed"));
       const ixs = Array.from({ length: cranksPerBatch }, () => ixCrank(crankBuffer, pushed, nowSlot));
-      const { err } = await sendIxs(ixs, 1_400_000, signal);
+      const { err } = await sendIxs(ixs, 1_400_000, signal, {
+        action: "loss-stale-heal",
+        assetIndexes: pushed,
+        observedSlot: nowSlot,
+      });
       if (err) console.log("  self-heal tx rejected");
       return err === null;
     },
@@ -376,11 +464,13 @@ console.log(`  Program: ${PROGRAM_ID.toBase58()}`);
 console.log(`  Market:  ${MARKET.toBase58()}`);
 console.log(`  Assets:  ${ASSETS.map((a) => `${a.index}=${a.symbol}`).join(", ")}`);
 console.log(`  Auth:    ${payer.publicKey.toBase58()}`);
+console.log(`  Mode:    ${KEEPER_MODE}`);
 console.log(`  Push:    every ${PUSH_INTERVAL_MS}ms\n`);
 
 let consecutiveErrors = 0;
 let healing = false;
 const rpcCircuit = new RpcCircuitBreaker(systemClock);
+const assetQuarantine = new AssetQuarantine(Date.now);
 const tickRunner = new SingleTickRunner(systemClock, TICK_DEADLINE_MS);
 const bootRunner = new SingleTickRunner(systemClock, TICK_DEADLINE_MS);
 const watchdog = new PushWatchdog(Date.now());
@@ -397,6 +487,64 @@ let marketStatusSettledHealthy = false;
 let nextMarketStatusCheckMs = 0;
 let nextLpHealthCheckMs = 0;
 let nextLpFailureHealthCheckMs = 0;
+
+interface AssetPushPlan {
+  index: number;
+  instruction: TransactionInstruction;
+  display: string;
+}
+
+async function pushAssetsWithIsolation(
+  plans: readonly AssetPushPlan[],
+  observedSlot: bigint,
+  signal: AbortSignal,
+): Promise<{ confirmed: boolean; plans: AssetPushPlan[]; sig: string }> {
+  const eligible = assetQuarantine.eligible(plans);
+  const open = assetQuarantine.snapshot().filter((state) => assetQuarantine.isOpen(state.assetIndex));
+  if (open.length > 0) {
+    console.error(`  degraded oracle set: quarantined asset indexes ${open.map((state) => state.assetIndex).join(",")}`);
+  }
+  if (eligible.length === 0) {
+    throw new KeeperFailure("onchain", "all oracle assets are temporarily quarantined");
+  }
+
+  const send = (batch: readonly AssetPushPlan[]) => sendIxs(
+    batch.map((plan) => plan.instruction),
+    400_000,
+    signal,
+    { action: "oracle-push", assetIndexes: batch.map((plan) => plan.index), observedSlot },
+  );
+  const first = await send(eligible);
+  if (first.err === null) {
+    if (first.confirmed) {
+      for (const plan of eligible) assetQuarantine.recordConfirmedSuccess(plan.index);
+    }
+    return { confirmed: first.confirmed, plans: eligible, sig: first.sig };
+  }
+
+  const isolated = await isolateRejectedAssets({
+    assets: eligible,
+    quarantine: assetQuarantine,
+    simulate: (plan) => simulateIxs([plan.instruction], 200_000, signal),
+  });
+  if (isolated.rejected.length > 0) {
+    console.error(`  isolated rejected oracle asset indexes ${isolated.rejected.map((state) => state.assetIndex).join(",")}`);
+  }
+  if (isolated.healthy.length === 0) {
+    throw new KeeperFailure("onchain", "oracle push rejected for every eligible asset");
+  }
+
+  // A single smaller retry salvages healthy majors without creating an
+  // unbounded retry tree or letting one bad feed stall the entire market.
+  const retry = await send(isolated.healthy);
+  if (retry.err !== null) {
+    throw new KeeperFailure("onchain", "healthy oracle retry batch rejected on-chain");
+  }
+  if (retry.confirmed) {
+    for (const plan of isolated.healthy) assetQuarantine.recordConfirmedSuccess(plan.index);
+  }
+  return { confirmed: retry.confirmed, plans: isolated.healthy, sig: retry.sig };
+}
 
 function stopKeeper(): void {
   if (lifecycle.isTerminal()) return;
@@ -436,32 +584,39 @@ async function tickInner(signal: AbortSignal) {
   });
 
   const nowSlot = BigInt(await conn.getSlot("confirmed"));
-  const pushIxs: TransactionInstruction[] = [];
-  const pushed: number[] = [];
-  const parts: string[] = [];
+  const plans: AssetPushPlan[] = [];
   for (const a of ASSETS) {
     const item = feeds.get(a.feedId)!;
     const price = Number(item.price.price) * Math.pow(10, item.price.expo);
-    pushIxs.push(ixPushAuthMark(a.index, nowSlot, BigInt(Math.round(price * 1_000_000))));
-    pushed.push(a.index);
-    parts.push(`${a.symbol} $${price.toFixed(price >= 1000 ? 0 : 2)}`);
+    plans.push({
+      index: a.index,
+      instruction: ixPushAuthMark(a.index, nowSlot, BigInt(Math.round(price * 1_000_000))),
+      display: `${a.symbol} $${price.toFixed(price >= 1000 ? 0 : 2)}`,
+    });
   }
   // Tx 1: PUSHES ONLY — must always land, whatever the crank thinks.
-  const push = await sendIxs(pushIxs, 400_000, signal);
-  if (push.err) throw new KeeperFailure("onchain", "oracle push rejected on-chain");
+  const push = await pushAssetsWithIsolation(plans, nowSlot, signal);
+  const pushed = push.plans.map((plan) => plan.index);
+  const parts = push.plans.map((plan) => plan.display);
   // A watchdog/circuit recovery only advances after a confirmation that contains
   // an explicit null on-chain error, never after timeout, cancellation, or a
   // missing confirmation result.
-  watchdog.recordConfirmedPush(Date.now(), true);
-  rpcCircuit.recordConfirmedSuccess();
-  watchdogSuppressedUntil = 0;
+  if (push.confirmed) {
+    watchdog.recordConfirmedPush(Date.now(), true);
+    rpcCircuit.recordConfirmedSuccess();
+    watchdogSuppressedUntil = 0;
+  }
 
   // Tx 2: crank the LP (settles its legs, advances effective prices).
-  const crank = await sendIxs([ixCrank(LP_PORTFOLIO, pushed, nowSlot)], 600_000, signal);
+  const crank = await sendIxs([ixCrank(LP_PORTFOLIO, pushed, nowSlot)], 600_000, signal, {
+    action: "lp-crank",
+    assetIndexes: pushed,
+    observedSlot: nowSlot,
+  });
   const time = new Date().toISOString().slice(11, 19);
   if (crank.err) {
     const isLossStale = isCustomProgramError(crank.err, 21);
-    console.log(`  [${time}] ${parts.join("  ")} push ✓, crank rejected${isLossStale ? " -> self-heal" : ""}`);
+    console.log(`  [${time}] ${parts.join("  ")} ${KEEPER_MODE === "shadow" ? "shadow push simulated" : "push ✓"}, crank rejected${isLossStale ? " -> self-heal" : ""}`);
     await reportLpHealth("crank rejected", signal);
     if (isLossStale && !healing) {
       knownLossStaleActive = true;
@@ -470,7 +625,7 @@ async function tickInner(signal: AbortSignal) {
       try { await selfHeal(pushed, signal); } finally { healing = false; }
     }
   } else {
-    console.log(`  [${time}] ${parts.join("  ")} push+crank ✓ ${crank.sig.slice(0, 8)}…`);
+    console.log(`  [${time}] ${parts.join("  ")} ${KEEPER_MODE === "shadow" ? "shadow push+crank simulated" : "push+crank ✓"} ${crank.sig.slice(0, 8)}…`);
     await reportLpHealth("periodic", signal);
     // A normal LP crank can succeed without catching every asset clock up
     // after a keeper outage. While the market's loss-stale lock is active,
@@ -515,6 +670,7 @@ async function tick() {
 
 // WATCHDOG: if pushes stop landing, die loudly — Fly restarts the machine.
 lifecycle.every(() => {
+  if (KEEPER_MODE === "shadow") return;
   if (Date.now() < watchdogSuppressedUntil) return;
   if (watchdog.shouldRestart(Date.now(), WATCHDOG_MS)) {
     console.error(`WATCHDOG: no successful push for ${WATCHDOG_MS / 1000}s — exiting for restart`);

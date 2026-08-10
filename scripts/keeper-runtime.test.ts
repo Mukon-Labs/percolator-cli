@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import {
+  AssetQuarantine,
+  BoundedShadowDecisionLog,
+  buildShadowDecision,
+  executeKeeperPlan,
+  isolateRejectedAssets,
+  keeperModeFromEnv,
+  recordSuccessfulShadowDecision,
+  type DecisionSink,
+} from "./keeper-shadow.ts";
 import {
   abortableSleep,
   classifyKeeperError,
@@ -55,6 +65,135 @@ const flush = async () => {
   await Promise.resolve();
   await Promise.resolve();
 };
+
+function shadowInstruction(byte: number): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 1)),
+    keys: [{
+      pubkey: new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => 255 - index)),
+      isSigner: true,
+      isWritable: true,
+    }],
+    data: Buffer.from([byte]),
+  });
+}
+
+class MemoryDecisionSink implements DecisionSink {
+  lines: string[] = [];
+  rotations = 0;
+  async append(line: string) { this.lines.push(line); }
+  async bytes() { return Buffer.byteLength(this.lines.join("")); }
+  async rotate() { this.rotations++; this.lines = []; }
+}
+
+test("shadow mode is explicit and invalid values fail closed", () => {
+  assert.equal(keeperModeFromEnv({}), "live");
+  assert.equal(keeperModeFromEnv({ KEEPER_MODE: " shadow " }), "shadow");
+  assert.throws(() => keeperModeFromEnv({ KEEPER_MODE: "dry-run" }), /live or shadow/);
+});
+
+test("shadow execution can simulate and record but cannot enter the broadcast branch", async () => {
+  let broadcasts = 0;
+  let simulations = 0;
+  let records = 0;
+  const accepted = await executeKeeperPlan({
+    mode: "shadow",
+    broadcast: async () => { broadcasts++; return "landed"; },
+    simulate: async () => { simulations++; return null; },
+    onShadowAccepted: async () => { records++; return "decision"; },
+  });
+  assert.deepEqual(accepted, { mode: "shadow", simulationError: null, value: "decision" });
+  assert.deepEqual({ broadcasts, simulations, records }, { broadcasts: 0, simulations: 1, records: 1 });
+
+  const rejected = await executeKeeperPlan({
+    mode: "shadow",
+    broadcast: async () => { broadcasts++; return "landed"; },
+    simulate: async () => ({ Custom: 9 }),
+    onShadowAccepted: async () => { records++; return "decision"; },
+  });
+  assert.deepEqual(rejected, { mode: "shadow", simulationError: { Custom: 9 }, value: null });
+  assert.deepEqual({ broadcasts, records }, { broadcasts: 0, records: 1 });
+
+  const live = await executeKeeperPlan({
+    mode: "live",
+    broadcast: async () => { broadcasts++; return "landed"; },
+    simulate: async () => { throw new Error("live mode must not simulate here"); },
+    onShadowAccepted: async () => { throw new Error("live mode must not record shadow decisions"); },
+  });
+  assert.deepEqual(live, { mode: "live", value: "landed" });
+  assert.equal(broadcasts, 1);
+});
+
+test("shadow decisions correlate by stable action while retaining exact intent", () => {
+  const common = {
+    action: "oracle-push" as const,
+    assetIndexes: [3, 0, 3],
+    createdAt: "2026-08-05T00:00:00.000Z",
+    market: PublicKey.default.toBase58(),
+    payer: PublicKey.default.toBase58(),
+  };
+  const first = buildShadowDecision({ ...common, instructions: [shadowInstruction(1)], observedSlot: 100n });
+  const second = buildShadowDecision({ ...common, instructions: [shadowInstruction(2)], observedSlot: 101n });
+  assert.equal(first.actionFingerprint, second.actionFingerprint);
+  assert.notEqual(first.instructionDigest, second.instructionDigest);
+  assert.notEqual(first.decisionId, second.decisionId);
+  assert.deepEqual(first.assetIndexes, [0, 3]);
+});
+
+test("failed shadow simulation is not recorded and the decision log remains bounded", async () => {
+  const sink = new MemoryDecisionSink();
+  const log = new BoundedShadowDecisionLog(sink, 1024);
+  const decisionInput = {
+    action: "lp-crank" as const,
+    assetIndexes: [0, 1, 2, 3],
+    createdAt: "2026-08-05T00:00:00.000Z",
+    instructions: [shadowInstruction(1)],
+    market: PublicKey.default.toBase58(),
+    observedSlot: 100n,
+    payer: PublicKey.default.toBase58(),
+  };
+  assert.equal(await recordSuccessfulShadowDecision({ simulationError: { Custom: 1 }, log, decision: decisionInput }), null);
+  assert.equal(sink.lines.length, 0);
+  const accepted = await recordSuccessfulShadowDecision({ simulationError: null, log, decision: decisionInput });
+  assert.ok(accepted);
+  for (let slot = 101n; slot < 106n; slot++) {
+    await log.append(buildShadowDecision({ ...decisionInput, observedSlot: slot }));
+  }
+  assert.ok(sink.rotations >= 1);
+  assert.ok(sink.lines.length >= 1);
+});
+
+test("rejected assets are isolated with bounded probes and can re-enter after backoff", async () => {
+  let now = 1_000;
+  const quarantine = new AssetQuarantine(() => now, 100, 400);
+  const assets = [{ index: 0 }, { index: 1 }, { index: 2 }, { index: 3 }];
+  const probed: number[] = [];
+  const isolated = await isolateRejectedAssets({
+    assets,
+    quarantine,
+    simulate: async (asset) => {
+      probed.push(asset.index);
+      return asset.index === 2 ? { Custom: 9 } : null;
+    },
+  });
+  assert.deepEqual(probed, [0, 1, 2, 3]);
+  assert.deepEqual(isolated.healthy.map((asset) => asset.index), [0, 1, 3]);
+  assert.deepEqual(quarantine.eligible(assets).map((asset) => asset.index), [0, 1, 3]);
+  now += 100;
+  assert.deepEqual(quarantine.eligible(assets).map((asset) => asset.index), [0, 1, 2, 3]);
+  quarantine.recordConfirmedSuccess(2);
+  assert.deepEqual(quarantine.snapshot(), []);
+
+  const sharedFailure = new AssetQuarantine(() => now, 100, 400);
+  const allRejected = await isolateRejectedAssets({
+    assets,
+    quarantine: sharedFailure,
+    simulate: async () => ({ Custom: 21 }),
+  });
+  assert.deepEqual(allRejected.healthy, []);
+  assert.deepEqual(allRejected.rejected, []);
+  assert.deepEqual(sharedFailure.snapshot(), [], 'a shared market failure must not quarantine every asset');
+});
 
 function deferred<T = void>(): { promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void } {
   let resolve!: (value: T) => void;
