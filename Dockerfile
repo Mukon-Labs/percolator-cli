@@ -8,7 +8,7 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --no-audit --no-fund
 
-# The keeper is a standalone tsx script (scripts/oracle-keeper.ts) — no build step.
+# The keeper is a standalone tsx script (scripts/oracle-keeper-v16.ts) — no build step.
 COPY . .
 
 CMD ["npm", "start"]
