@@ -70,6 +70,11 @@ import {
   readV16MarketCollateralMint,
   readV16MarketHealthSnapshot,
 } from "./v16-market-health.ts";
+import {
+  pythHermesHeaders,
+  pythHermesUrl,
+  requirePythHermesConfiguration,
+} from "./pyth-hermes.ts";
 
 const keeperConfiguration = requireKeeperConfiguration(process.env as {
   RPC_URL?: string;
@@ -77,6 +82,7 @@ const keeperConfiguration = requireKeeperConfiguration(process.env as {
 });
 const KEEPER_MODE = keeperModeFromEnv(process.env);
 const RPC_URL = keeperConfiguration.rpcUrl;
+const pythHermes = requirePythHermesConfiguration(process.env);
 const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID ?? "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq"
 );
@@ -90,7 +96,6 @@ const ASSETS: Array<{ index: number; symbol: string; feedId: string }> = [
   { index: 2, symbol: "ETH", feedId: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace" },
   { index: 3, symbol: "ZEC", feedId: "be9b59d178f0d6a97ab4c343bff2aa69caa1eaae3e9048a65788c529b125bb24" },
 ];
-const PYTH_HERMES_URL = "https://hermes.pyth.network";
 const PUSH_INTERVAL_MS = 5000;
 const TICK_DEADLINE_MS = 20_000;   // hard cap on one tick, releases the guard
 const WATCHDOG_MS = 150_000;       // no successful push for this long -> exit(1)
@@ -568,8 +573,15 @@ async function tickInner(signal: AbortSignal) {
     parentSignal: signal,
     timeoutMs: 5000,
     work: async (hermesSignal) => {
-      const q = ASSETS.map((a) => `ids[]=${a.feedId}`).join("&");
-      const resp = await fetch(`${PYTH_HERMES_URL}/v2/updates/price/latest?${q}`, { signal: hermesSignal });
+      const url = pythHermesUrl(
+        pythHermes,
+        "/v2/updates/price/latest",
+        ASSETS.map((asset) => ["ids[]", asset.feedId] as const),
+      );
+      const resp = await fetch(url, {
+        headers: pythHermesHeaders(pythHermes),
+        signal: hermesSignal,
+      });
       if (!resp.ok) {
         throw new KeeperFailure(
           resp.status === 429 ? "rate_limit" : "transport",

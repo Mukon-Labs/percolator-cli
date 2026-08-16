@@ -17,6 +17,11 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js";
 import * as fs from "fs";
+import {
+  pythHermesHeaders,
+  pythHermesUrl,
+  requirePythHermesConfiguration,
+} from "./pyth-hermes.ts";
 
 // --- Config ---
 const RPC_URL = process.env.RPC_URL ?? "https://api.devnet.solana.com";
@@ -32,7 +37,7 @@ const MARKETS: Array<{ symbol: string; slab: PublicKey; feedId: string }> = proc
       { symbol: "ETH", slab: new PublicKey("BZumn9yQuQqRtbTaR6wuY1eecUSpyUuBuysq2EJPZDpK"), feedId: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace" },
     ];
 const DEPLOYER_PATH = `${process.env.HOME}/.config/solana/mukon-deployer.json`;
-const PYTH_HERMES_URL = "https://hermes.pyth.network";
+const pythHermes = requirePythHermesConfiguration(process.env);
 const PUSH_INTERVAL_MS = 5000; // 3 markets/tick — keep total tx rate under devnet RPC limits
 const TX_TIMEOUT_MS = 8000;   // give up on confirmation after 8s; next tick will retry
 const MAX_BACKOFF_MS = 30_000;
@@ -101,8 +106,13 @@ async function pushPrices() {
     const fetchTimeout = setTimeout(() => controller.abort(), 5000);
     let resp: Response;
     try {
-      const q = MARKETS.map((m) => `ids[]=${m.feedId}`).join("&");
-      resp = await fetch(`${PYTH_HERMES_URL}/v2/updates/price/latest?${q}`, {
+      const url = pythHermesUrl(
+        pythHermes,
+        "/v2/updates/price/latest",
+        MARKETS.map((market) => ["ids[]", market.feedId] as const),
+      );
+      resp = await fetch(url, {
+        headers: pythHermesHeaders(pythHermes),
         signal: controller.signal,
       });
     } finally {

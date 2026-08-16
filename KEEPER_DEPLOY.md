@@ -14,7 +14,18 @@ rotation, and rate-limit incidents attributable.
   (`https://devnet.helius-rpc.com/?api-key=...`)
 - **QuickNode**: https://quicknode.com → create a Solana devnet endpoint
 
-## 2. Prepare the oracle-authority key for a secret
+## 2. Prepare the server-only credentials
+
+The keeper reads Pyth through authenticated Hermes. Create the API credential
+in Pyth Terminal and enter it only as the `PYTH_API_KEY` runtime secret. The
+default endpoint is the authenticated Core service at
+`https://hermes.pyth.network`; an alternative credential-free HTTPS provider
+URL may be supplied with the non-secret `PYTH_HERMES_URL` setting. Do not select
+the upgraded endpoint until the configured credential passes a redacted
+entitlement preflight.
+
+Never expose `PYTH_API_KEY` through `NEXT_PUBLIC_*`, logs, source, or a command
+that records shell history. Local development uses an ignored `.env` file.
 
 Fly has no local keypair file, so the existing oracle-authority signer is stored
 as the `KEEPER_SECRET_KEY` runtime secret. It is a Solana signer, not a Helius
@@ -43,14 +54,11 @@ fly machine list -a ninja-oracle-keeper
 fly secrets list -a ninja-oracle-keeper
 ```
 
-After code review, the operator stages required secret values without applying
-them to a machine yet:
-
-```bash
-fly secrets set --stage RPC_URL=... KEEPER_SECRET_KEY=... -a ninja-oracle-keeper
-```
-
-This is not a verification command; never put values in source or chat. Do not
+After code review and a fresh secret-change authorization, the operator enters
+the three values through Fly's server-side secret manager. Use the dashboard or
+an approved non-echoing/staged input flow; never put literal values in a shell
+command, source, logs or chat. Re-run the names-only `fly secrets list` check
+afterward. This is a mutation, not part of this read-only runbook check. Do not
 use `fly scale count` as singleton verification.
 
 After review and fresh authorization, choose one operation deliberately:
@@ -99,17 +107,21 @@ after that the keeper performs a bounded probe rather than sleeping forever.
 
 ## Config reference
 
-See `.env.example`. `RPC_URL` must be a dedicated keeper endpoint and
+See `.env.example`. `RPC_URL` must be a dedicated keeper endpoint,
 `KEEPER_SECRET_KEY` must be the existing oracle-authority signer (not LP,
-upgrade, browser, or mint-authority material). Both are required. Optional
+upgrade, browser, or mint-authority material), and `PYTH_API_KEY` must remain a
+server-only Pyth credential. All three are required. Optional
 `PROGRAM_ID`, `MARKET`, and `LP_PORTFOLIO` overrides must match the intended
-v16 deployment. `LP_MIN_CAPITAL_USDC` controls the warning floor only and
-defaults to 10,000 test USDC.
+v16 deployment. `PYTH_HERMES_URL` selects an alternative credential-free HTTPS
+Hermes provider without putting credentials in the URL. Do not select the
+upgraded endpoint until the configured credential passes a redacted entitlement
+preflight. `LP_MIN_CAPITAL_USDC` controls the warning floor only and defaults to
+10,000 test USDC.
 
 ## Local dev
 
-Local development also requires explicit `RPC_URL` and `KEEPER_SECRET_KEY`;
-there is no Solana CLI-identity fallback:
+Local development also requires explicit `RPC_URL`, `KEEPER_SECRET_KEY`, and
+`PYTH_API_KEY`; there is no Solana CLI-identity fallback:
 
 ```bash
 npm run keeper
