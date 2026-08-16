@@ -58,6 +58,7 @@ import {
   BoundedShadowDecisionLog,
   executeKeeperPlan,
   FileDecisionSink,
+  instructionSimulationErrorIndex,
   isolateRejectedAssets,
   keeperModeFromEnv,
   recordSuccessfulShadowDecision,
@@ -223,21 +224,30 @@ async function sendIxs(
   }
   const execution = await executeKeeperPlan({
     mode: KEEPER_MODE,
-    simulate: async () => (await conn.simulateTransaction(tx)).value.err ?? null,
-    onShadowAccepted: async () => recordSuccessfulShadowDecision({
-      simulationError: null,
-      log: shadowDecisionLog!,
-      decision: {
-        action: intent!.action,
-        assetIndexes: intent!.assetIndexes,
-        createdAt: new Date().toISOString(),
-        instructions: plannedIxs,
-        market: MARKET.toBase58(),
-        observedSlot: intent!.observedSlot,
-        payer: payer.publicKey.toBase58(),
-      },
-    }),
+    simulate: async () => {
+      if (signal.aborted) throw new KeeperFailure("cancelled", "keeper simulation cancelled");
+      const error = (await conn.simulateTransaction(tx)).value.err ?? null;
+      if (signal.aborted) throw new KeeperFailure("cancelled", "keeper simulation cancelled");
+      return error;
+    },
+    onShadowAccepted: async () => {
+      if (signal.aborted) throw new KeeperFailure("cancelled", "keeper simulation cancelled");
+      return recordSuccessfulShadowDecision({
+        simulationError: null,
+        log: shadowDecisionLog!,
+        decision: {
+          action: intent!.action,
+          assetIndexes: intent!.assetIndexes,
+          createdAt: new Date().toISOString(),
+          instructions: plannedIxs,
+          market: MARKET.toBase58(),
+          observedSlot: intent!.observedSlot,
+          payer: payer.publicKey.toBase58(),
+        },
+      });
+    },
     broadcast: async () => {
+      if (signal.aborted) throw new KeeperFailure("cancelled", "keeper transaction submission cancelled");
       const sig = await conn.sendRawTransaction(tx.serialize(), {
         skipPreflight: true,
         maxRetries: 0,
@@ -269,6 +279,7 @@ async function simulateIxs(
 ): Promise<unknown | null> {
   if (signal.aborted) throw new KeeperFailure("cancelled", "keeper simulation cancelled");
   const { blockhash } = await conn.getLatestBlockhash("confirmed");
+  if (signal.aborted) throw new KeeperFailure("cancelled", "keeper simulation cancelled");
   const tx = new Transaction();
   tx.recentBlockhash = blockhash;
   tx.feePayer = payer.publicKey;
@@ -277,6 +288,7 @@ async function simulateIxs(
   tx.add(...ixs);
   tx.sign(payer);
   const simulation = await conn.simulateTransaction(tx);
+  if (signal.aborted) throw new KeeperFailure("cancelled", "keeper simulation cancelled");
   return simulation.value.err ?? null;
 }
 
@@ -527,11 +539,36 @@ async function pushAssetsWithIsolation(
     return { confirmed: first.confirmed, plans: eligible, sig: first.sig };
   }
 
+  if (KEEPER_MODE === "shadow") {
+    const instructionIndex = instructionSimulationErrorIndex(first.err);
+    const firstAssetInstruction = 2; // compute-budget limit + heap-frame precede pushes
+    if (instructionIndex === null
+      || instructionIndex < firstAssetInstruction
+      || instructionIndex >= firstAssetInstruction + eligible.length) {
+      throw new KeeperFailure(
+        "transport",
+        "oracle batch simulation was inconclusive; no assets quarantined",
+      );
+    }
+  }
+
   const isolated = await isolateRejectedAssets({
     assets: eligible,
     quarantine: assetQuarantine,
     simulate: (plan) => simulateIxs([plan.instruction], 200_000, signal),
+    // Each isolated transaction has two compute-budget instructions followed
+    // by exactly one asset push at index 2. Anything else is an inconclusive
+    // RPC/transaction failure, not evidence against this asset.
+    classifyFailure: (_plan, error) => instructionSimulationErrorIndex(error) === 2
+      ? "asset-rejection"
+      : "inconclusive",
   });
+  if (isolated.inconclusive) {
+    throw new KeeperFailure(
+      "transport",
+      "oracle isolation simulation was inconclusive; no assets quarantined",
+    );
+  }
   if (isolated.rejected.length > 0) {
     console.error(`  isolated rejected oracle asset indexes ${isolated.rejected.map((state) => state.assetIndex).join(",")}`);
   }

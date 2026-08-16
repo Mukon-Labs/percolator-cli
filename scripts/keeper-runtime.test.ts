@@ -6,6 +6,7 @@ import {
   BoundedShadowDecisionLog,
   buildShadowDecision,
   executeKeeperPlan,
+  instructionSimulationErrorIndex,
   isolateRejectedAssets,
   keeperModeFromEnv,
   recordSuccessfulShadowDecision,
@@ -173,9 +174,13 @@ test("rejected assets are isolated with bounded probes and can re-enter after ba
     quarantine,
     simulate: async (asset) => {
       probed.push(asset.index);
-      return asset.index === 2 ? { Custom: 9 } : null;
+      return asset.index === 2 ? { InstructionError: [2, { Custom: 9 }] } : null;
     },
+    classifyFailure: (_asset, error) => instructionSimulationErrorIndex(error) === 2
+      ? "asset-rejection"
+      : "inconclusive",
   });
+  assert.equal(isolated.inconclusive, false);
   assert.deepEqual(probed, [0, 1, 2, 3]);
   assert.deepEqual(isolated.healthy.map((asset) => asset.index), [0, 1, 3]);
   assert.deepEqual(quarantine.eligible(assets).map((asset) => asset.index), [0, 1, 3]);
@@ -188,11 +193,40 @@ test("rejected assets are isolated with bounded probes and can re-enter after ba
   const allRejected = await isolateRejectedAssets({
     assets,
     quarantine: sharedFailure,
-    simulate: async () => ({ Custom: 21 }),
+    simulate: async () => ({ InstructionError: [2, { Custom: 21 }] }),
+    classifyFailure: (_asset, error) => instructionSimulationErrorIndex(error) === 2
+      ? "asset-rejection"
+      : "inconclusive",
   });
   assert.deepEqual(allRejected.healthy, []);
   assert.deepEqual(allRejected.rejected, []);
+  assert.equal(allRejected.inconclusive, false);
   assert.deepEqual(sharedFailure.snapshot(), [], 'a shared market failure must not quarantine every asset');
+});
+
+test("inconclusive simulation failures never quarantine the first probed asset", async () => {
+  const quarantine = new AssetQuarantine(() => 1_000, 100, 400);
+  const assets = [{ index: 0 }, { index: 1 }, { index: 2 }];
+  const isolated = await isolateRejectedAssets({
+    assets,
+    quarantine,
+    simulate: async (asset) => asset.index === 0 ? "BlockhashNotFound" : null,
+    classifyFailure: (_asset, error) => instructionSimulationErrorIndex(error) === 2
+      ? "asset-rejection"
+      : "inconclusive",
+  });
+  assert.equal(isolated.inconclusive, true);
+  assert.deepEqual(isolated.healthy, []);
+  assert.deepEqual(isolated.rejected, []);
+  assert.deepEqual(quarantine.snapshot(), []);
+  assert.deepEqual(quarantine.eligible(assets).map((asset) => asset.index), [0, 1, 2]);
+});
+
+test("only a validated Solana InstructionError exposes a simulation instruction index", () => {
+  assert.equal(instructionSimulationErrorIndex({ InstructionError: [2, { Custom: 9 }] }), 2);
+  assert.equal(instructionSimulationErrorIndex("BlockhashNotFound"), null);
+  assert.equal(instructionSimulationErrorIndex({ InstructionError: ["2", { Custom: 9 }] }), null);
+  assert.equal(instructionSimulationErrorIndex({ InstructionError: [-1, { Custom: 9 }] }), null);
 });
 
 function deferred<T = void>(): { promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void } {

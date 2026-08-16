@@ -192,6 +192,22 @@ export interface AssetQuarantineSnapshot {
   reason: string;
 }
 
+export type AssetSimulationFailure = "asset-rejection" | "inconclusive";
+
+/**
+ * Return the failing instruction index only for Solana's validated
+ * `InstructionError` transaction shape. RPC-level failures such as
+ * `BlockhashNotFound` deliberately return null: they do not prove that any
+ * particular asset instruction is bad.
+ */
+export function instructionSimulationErrorIndex(error: unknown): number | null {
+  if (!error || typeof error !== "object") return null;
+  const instructionError = (error as { InstructionError?: unknown }).InstructionError;
+  if (!Array.isArray(instructionError) || instructionError.length < 2) return null;
+  const index = instructionError[0];
+  return Number.isSafeInteger(index) && Number(index) >= 0 ? Number(index) : null;
+}
+
 /** Bounded, per-asset isolation for deterministic on-chain push failures. */
 export class AssetQuarantine {
   private readonly states = new Map<number, AssetQuarantineSnapshot>();
@@ -239,13 +255,22 @@ export async function isolateRejectedAssets<T extends { index: number }>(input: 
   assets: readonly T[];
   quarantine: AssetQuarantine;
   simulate: (asset: T) => Promise<unknown | null>;
-}): Promise<{ healthy: T[]; rejected: AssetQuarantineSnapshot[] }> {
+  classifyFailure: (asset: T, error: unknown) => AssetSimulationFailure;
+}): Promise<{ healthy: T[]; rejected: AssetQuarantineSnapshot[]; inconclusive: boolean }> {
   const healthy: T[] = [];
   const rejectedAssets: T[] = [];
+  let inconclusive = false;
   for (const asset of input.assets) {
     const error = await input.simulate(asset);
     if (error === null) healthy.push(asset);
-    else rejectedAssets.push(asset);
+    else if (input.classifyFailure(asset, error) === "asset-rejection") rejectedAssets.push(asset);
+    else inconclusive = true;
+  }
+  // Never partially quarantine after an RPC/transaction-level failure. A
+  // load-balanced RPC can return a fresh blockhash from one backend and reject
+  // it on another; whichever asset was probed first must not be blamed.
+  if (inconclusive) {
+    return { healthy: [], rejected: [], inconclusive: true };
   }
   // If every individual simulation fails, the evidence points to a shared
   // market/account condition, not one poisonous asset. Leave quarantine
@@ -253,5 +278,5 @@ export async function isolateRejectedAssets<T extends { index: number }>(input: 
   const rejected = healthy.length === 0
     ? []
     : rejectedAssets.map((asset) => input.quarantine.recordFailure(asset.index));
-  return { healthy, rejected };
+  return { healthy, rejected, inconclusive: false };
 }

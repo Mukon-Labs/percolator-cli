@@ -8,7 +8,9 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --no-audit --no-fund
 
-# The keeper is a standalone tsx script (scripts/oracle-keeper-v16.ts) — no build step.
+# The keeper is a standalone tsx script — no build step.
 COPY . .
 
-CMD ["npm", "start"]
+# Keep Node as PID 1 so Fly stop/restart signals reach the keeper's cancellation
+# handlers directly instead of waiting behind an npm child-process wrapper.
+CMD ["node", "node_modules/tsx/dist/cli.mjs", "scripts/oracle-keeper-v16.ts"]
