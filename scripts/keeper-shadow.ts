@@ -32,6 +32,16 @@ export function keeperModeFromEnv(env: Readonly<Record<string, string | undefine
   throw new Error("KEEPER_MODE must be live or shadow");
 }
 
+/**
+ * A returned shadow push has already completed a successful RPC simulation,
+ * while a returned live push is successful only after explicit confirmation.
+ * Both prove provider recovery for circuit-breaking purposes; only the live
+ * confirmation is allowed to advance the push watchdog.
+ */
+export function shouldResetRpcCircuitAfterPush(mode: KeeperMode, confirmed: boolean): boolean {
+  return mode === "shadow" || confirmed;
+}
+
 function digest(parts: readonly (string | Uint8Array)[]): string {
   const hash = createHash("sha256");
   for (const part of parts) {
@@ -193,6 +203,10 @@ export interface AssetQuarantineSnapshot {
 }
 
 export type AssetSimulationFailure = "asset-rejection" | "inconclusive";
+export type PlannedInstructionSimulationFailure =
+  | "planned-instruction"
+  | "other-instruction"
+  | "inconclusive";
 
 /**
  * Return the failing instruction index only for Solana's validated
@@ -206,6 +220,16 @@ export function instructionSimulationErrorIndex(error: unknown): number | null {
   if (!Array.isArray(instructionError) || instructionError.length < 2) return null;
   const index = instructionError[0];
   return Number.isSafeInteger(index) && Number(index) >= 0 ? Number(index) : null;
+}
+
+/** Attribute a shadow simulation error without treating an RPC-level failure as program evidence. */
+export function classifyPlannedInstructionSimulationFailure(
+  error: unknown,
+  plannedInstructionIndex: number,
+): PlannedInstructionSimulationFailure {
+  const instructionIndex = instructionSimulationErrorIndex(error);
+  if (instructionIndex === null) return "inconclusive";
+  return instructionIndex === plannedInstructionIndex ? "planned-instruction" : "other-instruction";
 }
 
 /** Bounded, per-asset isolation for deterministic on-chain push failures. */

@@ -56,12 +56,14 @@ import {
 import {
   AssetQuarantine,
   BoundedShadowDecisionLog,
+  classifyPlannedInstructionSimulationFailure,
   executeKeeperPlan,
   FileDecisionSink,
   instructionSimulationErrorIndex,
   isolateRejectedAssets,
   keeperModeFromEnv,
   recordSuccessfulShadowDecision,
+  shouldResetRpcCircuitAfterPush,
   type KeeperAction,
 } from "./keeper-shadow.ts";
 import {
@@ -647,13 +649,15 @@ async function tickInner(signal: AbortSignal) {
   const push = await pushAssetsWithIsolation(plans, nowSlot, signal);
   const pushed = push.plans.map((plan) => plan.index);
   const parts = push.plans.map((plan) => plan.display);
-  // A watchdog/circuit recovery only advances after a confirmation that contains
-  // an explicit null on-chain error, never after timeout, cancellation, or a
-  // missing confirmation result.
+  // The watchdog advances only after a live confirmation with an explicit null
+  // on-chain error. A successful shadow simulation still proves RPC recovery,
+  // so it resets only the provider circuit and never the watchdog.
   if (push.confirmed) {
     watchdog.recordConfirmedPush(Date.now(), true);
-    rpcCircuit.recordConfirmedSuccess();
     watchdogSuppressedUntil = 0;
+  }
+  if (shouldResetRpcCircuitAfterPush(KEEPER_MODE, push.confirmed)) {
+    rpcCircuit.recordConfirmedSuccess();
   }
 
   // Tx 2: crank the LP (settles its legs, advances effective prices).
@@ -664,6 +668,16 @@ async function tickInner(signal: AbortSignal) {
   });
   const time = new Date().toISOString().slice(11, 19);
   if (crank.err) {
+    if (KEEPER_MODE === "shadow") {
+      const crankInstructionIndex = 2; // compute-budget limit + heap-frame precede the crank
+      const failure = classifyPlannedInstructionSimulationFailure(crank.err, crankInstructionIndex);
+      if (failure === "inconclusive") {
+        throw new KeeperFailure("transport", "crank simulation was inconclusive");
+      }
+      if (failure === "other-instruction") {
+        throw new KeeperFailure("onchain", "crank simulation failed outside the crank instruction");
+      }
+    }
     const isLossStale = isCustomProgramError(crank.err, 21);
     console.log(`  [${time}] ${parts.join("  ")} ${KEEPER_MODE === "shadow" ? "shadow push simulated" : "push ✓"}, crank rejected${isLossStale ? " -> self-heal" : ""}`);
     await reportLpHealth("crank rejected", signal);

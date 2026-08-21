@@ -5,11 +5,13 @@ import {
   AssetQuarantine,
   BoundedShadowDecisionLog,
   buildShadowDecision,
+  classifyPlannedInstructionSimulationFailure,
   executeKeeperPlan,
   instructionSimulationErrorIndex,
   isolateRejectedAssets,
   keeperModeFromEnv,
   recordSuccessfulShadowDecision,
+  shouldResetRpcCircuitAfterPush,
   type DecisionSink,
 } from "./keeper-shadow.ts";
 import {
@@ -91,6 +93,22 @@ test("shadow mode is explicit and invalid values fail closed", () => {
   assert.equal(keeperModeFromEnv({}), "live");
   assert.equal(keeperModeFromEnv({ KEEPER_MODE: " shadow " }), "shadow");
   assert.throws(() => keeperModeFromEnv({ KEEPER_MODE: "dry-run" }), /live or shadow/);
+});
+
+test("shadow push simulation resets only RPC circuit success semantics", () => {
+  assert.equal(shouldResetRpcCircuitAfterPush("shadow", false), true);
+  assert.equal(shouldResetRpcCircuitAfterPush("live", true), true);
+  assert.equal(shouldResetRpcCircuitAfterPush("live", false), false);
+
+  const clock = fakeClock(1_000, 0);
+  const breaker = new RpcCircuitBreaker(clock, 30_000, 5_000, 15 * 60_000);
+  breaker.recordFailure(new KeeperFailure("transport", "inconclusive simulation"));
+  assert.deepEqual(breaker.snapshot(), { failures: 1, openUntilMs: 6_000 });
+  if (shouldResetRpcCircuitAfterPush("shadow", false)) breaker.recordConfirmedSuccess();
+  assert.deepEqual(breaker.snapshot(), { failures: 0, openUntilMs: 0 });
+
+  const watchdog = new PushWatchdog(1_000);
+  assert.equal(watchdog.lastSuccessMs(), null, "shadow circuit recovery must not advance the watchdog");
 });
 
 test("shadow execution can simulate and record but cannot enter the broadcast branch", async () => {
@@ -227,6 +245,21 @@ test("only a validated Solana InstructionError exposes a simulation instruction 
   assert.equal(instructionSimulationErrorIndex("BlockhashNotFound"), null);
   assert.equal(instructionSimulationErrorIndex({ InstructionError: ["2", { Custom: 9 }] }), null);
   assert.equal(instructionSimulationErrorIndex({ InstructionError: [-1, { Custom: 9 }] }), null);
+});
+
+test("shadow crank rejection requires failure at the exact planned instruction", () => {
+  assert.equal(
+    classifyPlannedInstructionSimulationFailure({ InstructionError: [2, { Custom: 21 }] }, 2),
+    "planned-instruction",
+  );
+  assert.equal(
+    classifyPlannedInstructionSimulationFailure({ InstructionError: [1, { Custom: 21 }] }, 2),
+    "other-instruction",
+  );
+  assert.equal(
+    classifyPlannedInstructionSimulationFailure("BlockhashNotFound", 2),
+    "inconclusive",
+  );
 });
 
 function deferred<T = void>(): { promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void } {
