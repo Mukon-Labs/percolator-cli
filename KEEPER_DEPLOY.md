@@ -116,7 +116,10 @@ v16 deployment. `PYTH_HERMES_URL` selects an alternative credential-free HTTPS
 Hermes provider without putting credentials in the URL. Do not select the
 upgraded endpoint until the configured credential passes a redacted entitlement
 preflight. `LP_MIN_CAPITAL_USDC` controls the warning floor only and defaults to
-10,000 test USDC.
+10,000 test USDC. `MARKET_MAX_CLOCK_LAG_SLOTS` defaults to 300 and gates the
+existing bounded legless-buffer recovery: catch-up continues while loss-stale
+is active or an active/drain-only asset exceeds that limit, then the keeper
+caches the settled state and stops the extra status read/recovery work.
 
 ## Local dev
 

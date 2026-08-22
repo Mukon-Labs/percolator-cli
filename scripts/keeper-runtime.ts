@@ -568,7 +568,7 @@ export function requireConfiguredHermesFeeds<T extends { id: string }>(
 const V16_MAGIC = 0x5045_5243_5631_3600n;
 const V16_HEADER_LEN = 16;
 const V16_PORTFOLIO_KIND = 2;
-const V16_PORTFOLIO_VERSION = 16;
+const V16_VERSION = 16;
 const V16_PROVENANCE_OFF = V16_HEADER_LEN;
 const V16_ACTIVE_BITMAP_OFF = V16_HEADER_LEN + 332;
 
@@ -589,7 +589,7 @@ export function isUsableLeglessCrankBuffer(input: {
   if (!input.programOwnerMatches || data.length !== input.expectedLength || data.length < V16_ACTIVE_BITMAP_OFF + 8) return false;
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   if (view.getBigUint64(0, true) !== V16_MAGIC
-    || view.getUint16(8, true) !== V16_PORTFOLIO_VERSION
+    || view.getUint16(8, true) !== V16_VERSION
     || view.getUint8(10) !== V16_PORTFOLIO_KIND
     || !equalBytes(data.subarray(V16_PROVENANCE_OFF, V16_PROVENANCE_OFF + 32), input.expectedMarket)
     || !equalBytes(data.subarray(V16_PROVENANCE_OFF + 32, V16_PROVENANCE_OFF + 64), input.expectedPortfolio)) return false;
@@ -793,13 +793,113 @@ export class KeeperLifecycle {
   }
 }
 
+const V16_MARKET_KIND = 1;
+const V16_WRAPPER_CONFIG_LEN = 448;
+const V16_MARKET_GROUP_OFFSET = V16_HEADER_LEN + V16_WRAPPER_CONFIG_LEN;
+const V16_MARKET_GROUP_HEADER_LEN = 726;
+const V16_MARKET_MIN_LEN = V16_MARKET_GROUP_OFFSET + V16_MARKET_GROUP_HEADER_LEN;
+const V16_ASSET_SLOT_LEN = 1797;
+const V16_ENGINE_ASSET_OFFSET = 512;
+const V16_MARKET_ID_OFFSET = V16_MARKET_GROUP_OFFSET;
+const V16_ASSET_CAPACITY_OFFSET = V16_MARKET_GROUP_OFFSET + 281;
+const V16_MARKET_CURRENT_SLOT_OFFSET = V16_MARKET_GROUP_OFFSET + 581;
+const V16_ASSET_LIFECYCLE_OFFSET = 16;
+const V16_ASSET_SLOT_LAST_OFFSET = 41;
+const V16_LIFECYCLE_ACTIVE = 2;
+const V16_LIFECYCLE_DRAIN_ONLY = 3;
+const V16_MAX_LIFECYCLE = 4;
+
+/** Layout-stable v16 market loss-stale flag. */
+export const V16_LOSS_STALE_ACTIVE_OFFSET = V16_MARKET_GROUP_OFFSET + 591;
+
+export interface V16RecoveryStatus {
+  laggingAssetIndexes: number[];
+  lossStaleActive: boolean;
+  marketCurrentSlot: bigint;
+  maxActiveAssetClockLag: bigint;
+  needsCatchUp: boolean;
+}
+
+export function parseRecoveryClockLagSlots(value: string | undefined, fallback = 300n): bigint {
+  const normalized = value?.trim() || fallback.toString();
+  if (!/^\d+$/.test(normalized)) {
+    throw new KeeperFailure("unknown", "MARKET_MAX_CLOCK_LAG_SLOTS must be a non-negative integer");
+  }
+  return BigInt(normalized);
+}
+
 /**
- * Layout-stable v16 market flag used only to decide whether the keeper should
- * run its existing legless-buffer catch-up path. The market account is
- * [header 16][wrapper config 448][market-group header]; loss_stale_active is
- * byte 591 in that header.
+ * Parse only the state needed to gate bounded recovery. All dynamic-layout and
+ * identity checks happen before a lifecycle or slot value can cause a write.
  */
-export const V16_LOSS_STALE_ACTIVE_OFFSET = 16 + 448 + 591;
+export function readV16RecoveryStatus(
+  marketData: Uint8Array,
+  expectedMarket: Uint8Array,
+  maxClockLagSlots: bigint,
+): V16RecoveryStatus {
+  if (maxClockLagSlots < 0n) {
+    throw new KeeperFailure("unknown", "market recovery clock-lag limit cannot be negative");
+  }
+  if (expectedMarket.length !== 32) {
+    throw new KeeperFailure("unknown", "configured v16 market identity is invalid");
+  }
+  if (marketData.length < V16_MARKET_MIN_LEN) {
+    throw new KeeperFailure("onchain", "v16 market recovery layout is unavailable");
+  }
+  const view = new DataView(marketData.buffer, marketData.byteOffset, marketData.byteLength);
+  if (view.getBigUint64(0, true) !== V16_MAGIC
+    || view.getUint16(8, true) !== V16_VERSION
+    || view.getUint8(10) !== V16_MARKET_KIND) {
+    throw new KeeperFailure("onchain", "market account is not the expected v16 market kind");
+  }
+  if (!equalBytes(
+    marketData.subarray(V16_MARKET_ID_OFFSET, V16_MARKET_ID_OFFSET + 32),
+    expectedMarket,
+  )) {
+    throw new KeeperFailure("onchain", "market account identity does not match the configured market");
+  }
+
+  const assetCapacity = view.getUint32(V16_ASSET_CAPACITY_OFFSET, true);
+  const expectedLength = V16_MARKET_MIN_LEN + assetCapacity * V16_ASSET_SLOT_LEN;
+  if (marketData.length !== expectedLength) {
+    throw new KeeperFailure("onchain", "market account length does not match its v16 asset-slot capacity");
+  }
+
+  const lossStaleValue = view.getUint8(V16_LOSS_STALE_ACTIVE_OFFSET);
+  if (lossStaleValue !== 0 && lossStaleValue !== 1) {
+    throw new KeeperFailure("onchain", "v16 market loss-stale flag is invalid");
+  }
+  const lossStaleActive = lossStaleValue === 1;
+  const marketCurrentSlot = view.getBigUint64(V16_MARKET_CURRENT_SLOT_OFFSET, true);
+  const laggingAssetIndexes: number[] = [];
+  let maxActiveAssetClockLag = 0n;
+
+  for (let asset = 0; asset < assetCapacity; asset += 1) {
+    const engineAssetOffset = V16_MARKET_MIN_LEN
+      + asset * V16_ASSET_SLOT_LEN
+      + V16_ENGINE_ASSET_OFFSET;
+    const lifecycle = view.getUint8(engineAssetOffset + V16_ASSET_LIFECYCLE_OFFSET);
+    if (lifecycle > V16_MAX_LIFECYCLE) {
+      throw new KeeperFailure("onchain", `v16 asset ${asset} lifecycle is invalid`);
+    }
+    if (lifecycle !== V16_LIFECYCLE_ACTIVE && lifecycle !== V16_LIFECYCLE_DRAIN_ONLY) continue;
+    const slotLast = view.getBigUint64(engineAssetOffset + V16_ASSET_SLOT_LAST_OFFSET, true);
+    if (slotLast > marketCurrentSlot) {
+      throw new KeeperFailure("onchain", `v16 asset ${asset} clock exceeds the market clock`);
+    }
+    const lag = marketCurrentSlot - slotLast;
+    if (lag > maxActiveAssetClockLag) maxActiveAssetClockLag = lag;
+    if (lag > maxClockLagSlots) laggingAssetIndexes.push(asset);
+  }
+
+  return {
+    laggingAssetIndexes,
+    lossStaleActive,
+    marketCurrentSlot,
+    maxActiveAssetClockLag,
+    needsCatchUp: lossStaleActive || laggingAssetIndexes.length > 0,
+  };
+}
 
 export function readV16LossStaleActive(marketData: Uint8Array): boolean {
   if (marketData.length <= V16_LOSS_STALE_ACTIVE_OFFSET) {

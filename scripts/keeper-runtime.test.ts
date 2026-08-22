@@ -31,8 +31,10 @@ import {
   linkedAbortController,
   modelCatchupCadence,
   parseKeeperSecretKey,
+  parseRecoveryClockLagSlots,
   PushWatchdog,
   readV16LossStaleActive,
+  readV16RecoveryStatus,
   requireConfiguredHermesFeeds,
   requireKeeperConfiguration,
   RpcCircuitBreaker,
@@ -942,6 +944,125 @@ test("v16 loss-stale parser accepts only the exact on-chain boolean encoding", (
     () => readV16LossStaleActive(new Uint8Array(V16_LOSS_STALE_ACTIVE_OFFSET)),
     /status layout/,
   );
+});
+
+const V16_TEST_MAGIC = 0x5045_5243_5631_3600n;
+const V16_TEST_GROUP_OFFSET = 16 + 448;
+const V16_TEST_GROUP_HEADER_LEN = 726;
+const V16_TEST_MARKET_MIN_LEN = V16_TEST_GROUP_OFFSET + V16_TEST_GROUP_HEADER_LEN;
+const V16_TEST_ASSET_SLOT_LEN = 1797;
+const V16_TEST_ENGINE_ASSET_OFFSET = 512;
+
+function recoveryMarketFixture(input: {
+  currentSlot?: bigint;
+  lifecycles?: number[];
+  lossStale?: boolean;
+  market?: Uint8Array;
+  slotLast?: bigint[];
+} = {}): { data: Buffer; market: Uint8Array } {
+  const currentSlot = input.currentSlot ?? 200_000n;
+  const lifecycles = input.lifecycles ?? [2, 2, 2, 2];
+  const market = input.market ?? Uint8Array.from({ length: 32 }, (_, index) => index + 1);
+  const slotLast = input.slotLast ?? lifecycles.map(() => currentSlot);
+  assert.equal(slotLast.length, lifecycles.length);
+  const data = Buffer.alloc(V16_TEST_MARKET_MIN_LEN + lifecycles.length * V16_TEST_ASSET_SLOT_LEN);
+  data.writeBigUInt64LE(V16_TEST_MAGIC, 0);
+  data.writeUInt16LE(16, 8);
+  data.writeUInt8(1, 10);
+  Buffer.from(market).copy(data, V16_TEST_GROUP_OFFSET);
+  data.writeUInt32LE(lifecycles.length, V16_TEST_GROUP_OFFSET + 281);
+  data.writeBigUInt64LE(currentSlot, V16_TEST_GROUP_OFFSET + 581);
+  data.writeUInt8(input.lossStale ? 1 : 0, V16_TEST_GROUP_OFFSET + 591);
+  for (let asset = 0; asset < lifecycles.length; asset += 1) {
+    const engineAssetOffset = V16_TEST_MARKET_MIN_LEN
+      + asset * V16_TEST_ASSET_SLOT_LEN
+      + V16_TEST_ENGINE_ASSET_OFFSET;
+    data.writeUInt8(lifecycles[asset], engineAssetOffset + 16);
+    data.writeBigUInt64LE(slotLast[asset], engineAssetOffset + 41);
+  }
+  return { data, market };
+}
+
+test("v16 recovery remains active after loss-stale clears until active asset clocks are bounded", () => {
+  const currentSlot = 200_000n;
+  const { data, market } = recoveryMarketFixture({
+    currentSlot,
+    slotLast: [currentSlot, currentSlot - 301n, currentSlot - 300n, currentSlot - 127_880n],
+  });
+  assert.deepEqual(readV16RecoveryStatus(data, market, 300n), {
+    laggingAssetIndexes: [1, 3],
+    lossStaleActive: false,
+    marketCurrentSlot: currentSlot,
+    maxActiveAssetClockLag: 127_880n,
+    needsCatchUp: true,
+  });
+});
+
+test("v16 recovery stops only when both the loss-stale lock and active clock lag are bounded", () => {
+  const currentSlot = 200_000n;
+  const locked = recoveryMarketFixture({ currentSlot, lossStale: true });
+  assert.equal(readV16RecoveryStatus(locked.data, locked.market, 300n).needsCatchUp, true);
+
+  const healthy = recoveryMarketFixture({
+    currentSlot,
+    slotLast: [currentSlot, currentSlot - 299n, currentSlot - 300n, currentSlot],
+  });
+  assert.deepEqual(readV16RecoveryStatus(healthy.data, healthy.market, 300n), {
+    laggingAssetIndexes: [],
+    lossStaleActive: false,
+    marketCurrentSlot: currentSlot,
+    maxActiveAssetClockLag: 300n,
+    needsCatchUp: false,
+  });
+});
+
+test("v16 recovery ignores configured/retired slots but includes drain-only assets", () => {
+  const currentSlot = 200_000n;
+  const { data, market } = recoveryMarketFixture({
+    currentSlot,
+    lifecycles: [0, 1, 4, 3],
+    slotLast: [0n, 0n, 0n, currentSlot - 301n],
+  });
+  const status = readV16RecoveryStatus(data, market, 300n);
+  assert.deepEqual(status.laggingAssetIndexes, [3]);
+  assert.equal(status.maxActiveAssetClockLag, 301n);
+  assert.equal(status.needsCatchUp, true);
+});
+
+test("v16 recovery parsing fails closed on identity, layout, lifecycle, clock, and config errors", () => {
+  const fixture = recoveryMarketFixture();
+  assert.throws(
+    () => readV16RecoveryStatus(fixture.data, new Uint8Array(32), 300n),
+    /identity does not match/,
+  );
+  assert.throws(
+    () => readV16RecoveryStatus(fixture.data.subarray(0, -1), fixture.market, 300n),
+    /asset-slot capacity/,
+  );
+
+  const wrongKind = Buffer.from(fixture.data);
+  wrongKind.writeUInt8(2, 10);
+  assert.throws(() => readV16RecoveryStatus(wrongKind, fixture.market, 300n), /v16 market kind/);
+
+  const invalidBool = Buffer.from(fixture.data);
+  invalidBool.writeUInt8(2, V16_TEST_GROUP_OFFSET + 591);
+  assert.throws(() => readV16RecoveryStatus(invalidBool, fixture.market, 300n), /loss-stale flag/);
+
+  const invalidLifecycle = Buffer.from(fixture.data);
+  invalidLifecycle.writeUInt8(5, V16_TEST_MARKET_MIN_LEN + V16_TEST_ENGINE_ASSET_OFFSET + 16);
+  assert.throws(() => readV16RecoveryStatus(invalidLifecycle, fixture.market, 300n), /lifecycle/);
+
+  const futureClock = Buffer.from(fixture.data);
+  futureClock.writeBigUInt64LE(200_001n, V16_TEST_MARKET_MIN_LEN + V16_TEST_ENGINE_ASSET_OFFSET + 41);
+  assert.throws(() => readV16RecoveryStatus(futureClock, fixture.market, 300n), /exceeds the market clock/);
+  assert.throws(() => readV16RecoveryStatus(fixture.data, fixture.market, -1n), /cannot be negative/);
+});
+
+test("keeper recovery clock-lag configuration defaults to the auditor bound and rejects ambiguity", () => {
+  assert.equal(parseRecoveryClockLagSlots(undefined), 300n);
+  assert.equal(parseRecoveryClockLagSlots(" 450 "), 450n);
+  assert.throws(() => parseRecoveryClockLagSlots("-1"), /non-negative integer/);
+  assert.throws(() => parseRecoveryClockLagSlots("1.5"), /non-negative integer/);
 });
 
 test("sanitizers redact HTTP/WSS URLs, authorization/api-key forms, and unhandled rejections", () => {
