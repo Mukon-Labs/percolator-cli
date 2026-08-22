@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   assessV16MarketHealth,
   formatV16MarketHealth,
+  parseUsdcAmount,
   parseUsdcFloor,
   readV16MarketCollateralMint,
   readV16MarketHealthSnapshot,
@@ -11,6 +12,12 @@ import {
 
 const MAGIC = 0x5045_5243_5631_3600n;
 const MARKET_GROUP_OFF = 464;
+const MARKET_GROUP_HEADER_LEN = 726;
+const ASSET_SLOT_LEN = 1797;
+const ASSET_BASE = MARKET_GROUP_OFF + MARKET_GROUP_HEADER_LEN;
+const ENGINE_BASE = ASSET_BASE + 512;
+const ADL_ONE = 1_000_000_000_000_000n;
+const CREDIT_RATE_ONE = 1_000_000_000_000n;
 const MARKET_ID = new Uint8Array(32).fill(3);
 const LP_ID = new Uint8Array(32).fill(4);
 
@@ -26,19 +33,45 @@ function writeI128(data: Buffer, offset: number, value: bigint): void {
 function marketFixture(input: {
   vault?: bigint;
   capital?: bigint;
+  domainInsurance?: bigint;
   insurance?: bigint;
   lossStale?: boolean;
 } = {}): Buffer {
-  const data = Buffer.alloc(MARKET_GROUP_OFF + 726);
+  const insurance = input.insurance ?? 10_000_000_000n;
+  const domainInsurance = input.domainInsurance ?? insurance;
+  const data = Buffer.alloc(MARKET_GROUP_OFF + MARKET_GROUP_HEADER_LEN + ASSET_SLOT_LEN);
   data.writeBigUInt64LE(MAGIC, 0);
   data.writeUInt16LE(16, 8);
   data.writeUInt8(1, 10);
+  data.set(new Uint8Array(32).fill(1), 16);
   data.set(new Uint8Array(32).fill(2), 48);
   data.set(MARKET_ID, MARKET_GROUP_OFF);
+  data.writeUInt32LE(1, MARKET_GROUP_OFF + 281);
   writeU128(data, MARKET_GROUP_OFF + 285, input.vault ?? 120_000_000_000n);
-  writeU128(data, MARKET_GROUP_OFF + 301, input.insurance ?? 10_000_000_000n);
+  writeU128(data, MARKET_GROUP_OFF + 301, insurance);
   writeU128(data, MARKET_GROUP_OFF + 317, input.capital ?? 100_000_000_000n);
+  writeU128(data, MARKET_GROUP_OFF + 461, domainInsurance);
+  data.writeBigUInt64LE(1n, MARKET_GROUP_OFF + 517);
+  data.writeBigUInt64LE(1n, MARKET_GROUP_OFF + 525);
+  data.writeBigUInt64LE(1n, MARKET_GROUP_OFF + 557);
+  data.writeBigUInt64LE(1n, MARKET_GROUP_OFF + 565);
+  data.writeBigUInt64LE(1000n, MARKET_GROUP_OFF + 573);
+  data.writeBigUInt64LE(1000n, MARKET_GROUP_OFF + 581);
   data.writeUInt8(input.lossStale ? 1 : 0, MARKET_GROUP_OFF + 591);
+  data.writeBigUInt64LE(1000n, 168);
+  data.writeUInt8(2, ENGINE_BASE + 16);
+  data.writeBigUInt64LE(1000n, ENGINE_BASE + 41);
+  writeU128(data, ENGINE_BASE + 49, ADL_ONE);
+  writeU128(data, ENGINE_BASE + 65, ADL_ONE);
+  const longBudget = domainInsurance / 2n;
+  writeU128(data, ENGINE_BASE + 499, longBudget);
+  writeU128(data, ENGINE_BASE + 515, domainInsurance - longBudget);
+  writeU128(data, ENGINE_BASE + 579 + 160, CREDIT_RATE_ONE);
+  writeU128(data, ENGINE_BASE + 763 + 160, CREDIT_RATE_ONE);
+  data.writeBigUInt64LE(2000n, ENGINE_BASE + 947 + 88);
+  data.writeBigUInt64LE(2000n, ENGINE_BASE + 1044 + 88);
+  data.writeUInt8(1, ENGINE_BASE + 947 + 96);
+  data.writeUInt8(1, ENGINE_BASE + 1044 + 96);
   return data;
 }
 
@@ -65,6 +98,10 @@ function lpFixture(input: {
   writeI128(data, 8932, input.certifiedEquity ?? 48_000_000_000n);
   writeU128(data, 8948, input.initialRequirement ?? 10_000_000_000n);
   writeU128(data, 8964, input.maintenanceRequirement ?? 5_000_000_000n);
+  data.writeBigUInt64LE(1n, 9012);
+  data.writeBigUInt64LE(1n, 9020);
+  data.writeBigUInt64LE(1n, 9028);
+  data.writeBigUInt64LE(1n, 9036);
   data.writeUInt8(input.certValid === false ? 0 : 1, 9052);
   return data;
 }
@@ -73,6 +110,7 @@ function snapshot(input: {
   custody?: bigint;
   market?: Parameters<typeof marketFixture>[0];
   lp?: Parameters<typeof lpFixture>[0];
+  observedSlot?: bigint;
 } = {}) {
   return readV16MarketHealthSnapshot({
     custodyBalance: input.custody ?? input.market?.vault ?? 120_000_000_000n,
@@ -80,7 +118,27 @@ function snapshot(input: {
     expectedMarket: MARKET_ID,
     lpData: lpFixture(input.lp),
     marketData: marketFixture(input.market),
+    observedClusterSlot: input.observedSlot ?? 1000n,
   });
+}
+
+function snapshotFromBuffers(
+  marketData: Buffer,
+  lpData = lpFixture(),
+  observedClusterSlot = 1000n,
+) {
+  return readV16MarketHealthSnapshot({
+    custodyBalance: readU128ForTest(marketData, MARKET_GROUP_OFF + 285),
+    expectedLpPortfolio: LP_ID,
+    expectedMarket: MARKET_ID,
+    lpData,
+    marketData,
+    observedClusterSlot,
+  });
+}
+
+function readU128ForTest(data: Buffer, offset: number): bigint {
+  return data.readBigUInt64LE(offset) | (data.readBigUInt64LE(offset + 8) << 64n);
 }
 
 test("healthy LP separates custody, aggregate capital, insurance, and matcher equity", () => {
@@ -122,6 +180,7 @@ test("custody/accounting mismatch and an impossible senior stack fail invalid", 
   const custodyMismatch = assessV16MarketHealth(snapshot({ custody: 119_000_000_000n }), 0n);
   assert.equal(custodyMismatch.level, "invalid");
   assert.equal(custodyMismatch.custodyDelta, -1_000_000_000n);
+  assert.ok(custodyMismatch.invalidReasons.some((reason) => reason.includes("custody")));
 
   const seniorDeficit = assessV16MarketHealth(snapshot({
     market: { vault: 100n, capital: 90n, insurance: 20n },
@@ -137,11 +196,91 @@ test("loss-stale and maintenance deficits are critical; invalid certificates sta
     lp: { certifiedEquity: 4_000_000_000n, maintenanceRequirement: 5_000_000_000n },
   }), 0n);
   assert.equal(underMaintenance.level, "critical");
+  assert.ok(underMaintenance.criticalReasons.some((reason) => reason.includes("maintenance")));
 
   const unavailable = assessV16MarketHealth(snapshot({ lp: { certValid: false, activeBitmap: 3n } }), 0n);
   assert.equal(unavailable.level, "critical");
   assert.equal(unavailable.lpCertifiedEquity, null);
-  assert.ok(unavailable.reasons.some((reason) => reason.includes("without a valid health certificate")));
+  assert.ok(unavailable.reasons.some((reason) => reason.includes("without a current health certificate")));
+});
+
+test("zero-OI residue, reset mode, and non-unit A are critical", () => {
+  const market = marketFixture();
+  writeU128(market, ENGINE_BASE + 353, 1n);
+  market.writeBigUInt64LE(1n, ENGINE_BASE + 305);
+  writeU128(market, ENGINE_BASE + 49, ADL_ONE - 1n);
+  market.writeUInt8(2, ENGINE_BASE + 497);
+  const health = assessV16MarketHealth(snapshotFromBuffers(market), 0n);
+  assert.equal(health.level, "critical");
+  assert.ok(health.reasons.some((reason) => reason.includes("zero-OI residue")));
+  assert.ok(health.reasons.some((reason) => reason.includes("zero OI with non-unit A")));
+  assert.ok(health.reasons.some((reason) => reason.includes("not in normal mode")));
+});
+
+test("open interest with a non-unit A is critical", () => {
+  const market = marketFixture();
+  writeU128(market, ENGINE_BASE + 273, 500_000n);
+  writeU128(market, ENGINE_BASE + 353, 500_000n);
+  market.writeBigUInt64LE(1n, ENGINE_BASE + 305);
+  writeU128(market, ENGINE_BASE + 49, ADL_ONE - 1n);
+  const health = assessV16MarketHealth(snapshotFromBuffers(market), 0n);
+  assert.equal(health.level, "critical");
+  assert.ok(health.reasons.some((reason) => reason.includes("open interest with non-unit A")));
+});
+
+test("insurance-domain accounting fails closed and stale backing is critical", () => {
+  const inconsistent = marketFixture();
+  writeU128(inconsistent, MARKET_GROUP_OFF + 461, 9_000_000_000n);
+  const accounting = assessV16MarketHealth(snapshotFromBuffers(inconsistent), 0n);
+  assert.equal(accounting.level, "invalid");
+  assert.ok(accounting.reasons.some((reason) => reason.includes("does not sum")));
+
+  const stale = marketFixture();
+  stale.writeUInt8(0, ENGINE_BASE + 947 + 96);
+  writeU128(stale, ENGINE_BASE + 763 + 160, CREDIT_RATE_ONE - 1n);
+  const backing = assessV16MarketHealth(snapshotFromBuffers(stale), 0n);
+  assert.equal(backing.level, "critical");
+  assert.ok(backing.reasons.some((reason) => reason.includes("backing is not fresh")));
+  assert.ok(backing.reasons.some((reason) => reason.includes("credit rate is not 1")));
+});
+
+test("clock lag and stale LP certificate epochs are critical", () => {
+  const lagged = assessV16MarketHealth(snapshot({ observedSlot: 1301n }), 0n, {
+    maxClockLagSlots: 300n,
+  });
+  assert.equal(lagged.level, "critical");
+  assert.ok(lagged.reasons.some((reason) => reason.includes("clock exceeds")));
+
+  const lp = lpFixture();
+  lp.writeBigUInt64LE(2n, 9012);
+  const staleCert = assessV16MarketHealth(snapshotFromBuffers(marketFixture(), lp), 0n);
+  assert.equal(staleCert.level, "critical");
+  assert.equal(staleCert.lpCertCurrent, false);
+  assert.ok(staleCert.reasons.some((reason) => reason.includes("current health certificate")));
+});
+
+test("recovered target is healthy only with certified risk equity and exact insurance", () => {
+  const health = assessV16MarketHealth(snapshot({
+    market: {
+      vault: 200_000_000_000n,
+      capital: 100_000_000_000n,
+      insurance: 100_000_000_000n,
+      domainInsurance: 100_000_000_000n,
+    },
+    lp: {
+      capital: 100_000_000_000n,
+      certifiedEquity: 100_000_000_000n,
+    },
+  }), 0n, {
+    expectedDomainInsurance: 100_000_000_000n,
+    maxClockLagSlots: 300n,
+    minimumLpRiskEquity: 100_000_000_000n,
+    requireAuthorityParity: true,
+  });
+  assert.equal(health.level, "healthy");
+  assert.equal(health.lpRiskEquity, 100_000_000_000n);
+  assert.equal(health.lpCertCurrent, true);
+  assert.equal(health.domainInsurance, 100_000_000_000n);
 });
 
 test("identity, boolean, and operating-floor parsing fail closed", () => {
@@ -184,6 +323,8 @@ test("identity, boolean, and operating-floor parsing fail closed", () => {
   assert.equal(parseUsdcFloor(undefined), 10_000_000_000n);
   assert.equal(parseUsdcFloor("1250.5"), 1_250_500_000n);
   assert.throws(() => parseUsdcFloor("-1"), /LP_MIN_CAPITAL_USDC/);
+  assert.equal(parseUsdcAmount(undefined, 100_000, "TARGET"), 100_000_000_000n);
+  assert.throws(() => parseUsdcAmount("1.0000001", 0, "TARGET"), /TARGET/);
 });
 
 test("keeper reports startup, periodic, and rejected-crank health without funding", async () => {
@@ -194,4 +335,11 @@ test("keeper reports startup, periodic, and rejected-crank health without fundin
   assert.match(source, /LP_HEALTH_CHECK_MS = 5 \* 60_000/);
   assert.match(source, /LP_FAILURE_HEALTH_CHECK_MS = 60_000/);
   assert.doesNotMatch(source, /fund-current-market-lp|mintTo|topUpBacking|depositInstruction/);
+
+  const checker = await readFile(new URL("./check-current-market-health.ts", import.meta.url), "utf8");
+  assert.match(checker, /getMultipleAccountsInfoAndContext/);
+  assert.match(checker, /minContextSlot/);
+  assert.match(checker, /AccountLayout\.decode/);
+  assert.doesNotMatch(checker, /getTokenAccountBalance/);
+  assert.doesNotMatch(checker, /sendRawTransaction|sendTransaction|simulateTransaction|TransactionInstruction/);
 });

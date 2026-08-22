@@ -16,7 +16,7 @@
     "keeper": "tsx scripts/oracle-keeper-v16.ts",
     "test:keeper-runtime": "tsx scripts/keeper-runtime.test.ts",
     "test:pyth-auth": "tsx scripts/pyth-hermes.test.ts",
-    "test:v16-health": "tsx scripts/v16-market-health.test.ts",
+    "test:v16-health": "tsx scripts/v16-market-health.test.ts && tsx scripts/v16-market-coherence.test.ts",
     "check:v16-health": "tsx scripts/check-current-market-health.ts",
     "test:fund-lp": "tsx scripts/fund-current-market-lp.test.ts",
     "test": "tsx test/abi.test.ts && tsx test/pda.test.ts && tsx test/slab.test.ts && tsx test/validation.test.ts && tsx test/oracle.test.ts"
