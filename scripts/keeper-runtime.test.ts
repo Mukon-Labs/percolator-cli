@@ -29,6 +29,7 @@ import {
   KeeperFailure,
   KeeperLifecycle,
   linkedAbortController,
+  marketRecoveryStatusProbeDue,
   modelCatchupCadence,
   parseKeeperSecretKey,
   parseRecoveryClockLagSlots,
@@ -1014,6 +1015,15 @@ test("v16 recovery stops only when both the loss-stale lock and active clock lag
     maxActiveAssetClockLag: 300n,
     needsCatchUp: false,
   });
+});
+
+test("healthy recovery status still permits the next bounded probe", () => {
+  const nextCheck = 31_000;
+  assert.equal(marketRecoveryStatusProbeDue(nextCheck - 1, nextCheck), false);
+  assert.equal(marketRecoveryStatusProbeDue(nextCheck, nextCheck), true);
+  assert.equal(marketRecoveryStatusProbeDue(nextCheck + 1, nextCheck), true);
+  assert.throws(() => marketRecoveryStatusProbeDue(Number.NaN, nextCheck), /finite and non-negative/);
+  assert.throws(() => marketRecoveryStatusProbeDue(nextCheck, -1), /finite and non-negative/);
 });
 
 test("v16 recovery ignores configured/retired slots but includes drain-only assets", () => {

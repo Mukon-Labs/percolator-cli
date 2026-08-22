@@ -40,6 +40,7 @@ import {
   KeeperLifecycle,
   KeeperFailure,
   isCustomProgramError,
+  marketRecoveryStatusProbeDue,
   parseRecoveryClockLagSlots,
   parseKeeperSecretKey,
   PushWatchdog,
@@ -425,12 +426,13 @@ async function fetchMarketRecoveryStatus(signal: AbortSignal): Promise<V16Recove
 }
 
 async function marketNeedsCatchUp(parentSignal: AbortSignal): Promise<boolean> {
-  // Once a direct status read confirms the lock and every active asset clock
-  // are healthy, Custom-21 remains the trigger for reopening this recovery
-  // probe. Avoid a recurring account read in the ordinary push path.
-  if (marketStatusSettledHealthy) return false;
+  // A healthy status suppresses recovery writes, but never permanently
+  // suppresses this bounded probe. Passive asset clocks can cross the limit
+  // without first producing Custom-21.
   const now = Date.now();
-  if (now < nextMarketStatusCheckMs) return knownMarketNeedsCatchUp;
+  if (!marketRecoveryStatusProbeDue(now, nextMarketStatusCheckMs)) {
+    return knownMarketNeedsCatchUp;
+  }
   try {
     const status = await runDeadlineBoundOperation({
       parentSignal,
@@ -438,7 +440,6 @@ async function marketNeedsCatchUp(parentSignal: AbortSignal): Promise<boolean> {
       work: fetchMarketRecoveryStatus,
     });
     knownMarketNeedsCatchUp = status.needsCatchUp;
-    marketStatusSettledHealthy = !status.needsCatchUp;
     nextMarketStatusCheckMs = now + MARKET_STATUS_CHECK_MS;
     if (!status.lossStaleActive && status.laggingAssetIndexes.length > 0) {
       console.log(
@@ -536,7 +537,6 @@ const lifecycle = new KeeperLifecycle(
 let watchdogSuppressedUntil = 0;
 let transientBackoffUntil = 0;
 let knownMarketNeedsCatchUp = false;
-let marketStatusSettledHealthy = false;
 let nextMarketStatusCheckMs = 0;
 let nextLpHealthCheckMs = 0;
 let nextLpFailureHealthCheckMs = 0;
@@ -717,7 +717,6 @@ async function tickInner(signal: AbortSignal) {
     await reportLpHealth("crank rejected", signal);
     if (isLossStale && !healing) {
       knownMarketNeedsCatchUp = true;
-      marketStatusSettledHealthy = false;
       healing = true;
       try { await selfHeal(pushed, signal); } finally { healing = false; }
     }

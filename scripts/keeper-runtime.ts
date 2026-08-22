@@ -829,6 +829,18 @@ export function parseRecoveryClockLagSlots(value: string | undefined, fallback =
 }
 
 /**
+ * A healthy sample suppresses recovery writes, not future bounded status
+ * reads. Passive asset clocks can cross the configured limit without first
+ * producing the Custom-21 signal that previously reopened the probe.
+ */
+export function marketRecoveryStatusProbeDue(nowMs: number, nextCheckMs: number): boolean {
+  if (!Number.isFinite(nowMs) || !Number.isFinite(nextCheckMs) || nowMs < 0 || nextCheckMs < 0) {
+    throw new Error("market recovery probe timestamps must be finite and non-negative");
+  }
+  return nowMs >= nextCheckMs;
+}
+
+/**
  * Parse only the state needed to gate bounded recovery. All dynamic-layout and
  * identity checks happen before a lifecycle or slot value can cause a write.
  */
