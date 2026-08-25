@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-export type KeeperFailureKind = "cancelled" | "onchain" | "rate_limit" | "timeout" | "transport" | "unknown";
+export type KeeperFailureKind = "cancelled" | "expired" | "onchain" | "pending" | "rate_limit" | "timeout" | "transport" | "unknown";
 
 export class KeeperFailure extends Error {
   constructor(
@@ -189,7 +189,12 @@ export interface ConfirmationStrategy {
 }
 
 export interface ConfirmationConnection {
+  getBlockHeight?(commitment: "confirmed"): Promise<number>;
   getSignatureStatus(signature: string): Promise<unknown>;
+  getSignatureStatuses?(
+    signatures: string[],
+    config: { searchTransactionHistory: true },
+  ): Promise<unknown>;
   onSignature(
     signature: string,
     callback: (result: { err: unknown }, context: unknown) => void,
@@ -223,11 +228,27 @@ function fallbackConfirmationResult(response: unknown): { context: unknown; valu
   const { context, value } = response as { context?: unknown; value?: unknown };
   if (!value || typeof value !== "object" || !("err" in value)) return null;
   const status = value as { confirmationStatus?: unknown; err: unknown };
-  if (status.err !== null) return { context, value: { err: status.err } };
-  // The keeper confirms at "confirmed"; a processed-only fallback cannot
-  // advance watchdog health or beat the websocket subscription.
+  // The keeper confirms at "confirmed". A processed-only status is not
+  // terminal even when it carries an execution error: that fork can still be
+  // abandoned, so clearing the pending signature could permit a replacement
+  // while the original remains valid elsewhere.
   if (status.confirmationStatus !== "confirmed" && status.confirmationStatus !== "finalized") return null;
-  return { context, value: { err: null } };
+  return { context, value: { err: status.err } };
+}
+
+function historicalConfirmationResult(response: unknown): {
+  found: boolean;
+  result: { context: unknown; value: { err: unknown } } | null;
+} {
+  if (!response || typeof response !== "object") return { found: false, result: null };
+  const { context, value } = response as { context?: unknown; value?: unknown };
+  if (!Array.isArray(value) || value.length !== 1) return { found: false, result: null };
+  const status = value[0];
+  if (!status || typeof status !== "object" || !("err" in status)) return { found: false, result: null };
+  return {
+    found: true,
+    result: fallbackConfirmationResult({ context, value: status }),
+  };
 }
 
 export function formatConfirmationFallbackError(error: unknown): string {
@@ -241,9 +262,10 @@ export function formatConfirmationFallbackError(error: unknown): string {
  * cannot safely share an operation abort signal with the keeper.
  */
 export async function confirmConnectionTransaction(input: {
-  clock?: Pick<Clock, "clearTimeout" | "setTimeout">;
+  clock?: Clock;
   connection: ConfirmationConnection;
   parentSignal: AbortSignal;
+  pollIntervalMs?: number;
   runWithOperationSignal<T>(signal: AbortSignal, work: () => Promise<T>): Promise<T>;
   reportUnexpectedFallbackError?: (message: string) => void;
   strategy: ConfirmationStrategy;
@@ -257,8 +279,6 @@ export async function confirmConnectionTransaction(input: {
     return await input.runWithOperationSignal(confirmation.signal, async () => {
       let subscriptionId: number | null = null;
       let subscriptionDelivered = false;
-      let disposeSubscriptionStateObserver: (() => void) | undefined;
-      let fallbackStarted = false;
       let settled = false;
       let resolveOutcome!: (result: unknown) => void;
       let rejectOutcome!: (error: unknown) => void;
@@ -277,26 +297,6 @@ export async function confirmConnectionTransaction(input: {
       if (confirmation.signal.aborted) onAbort();
       else confirmation.signal.addEventListener("abort", onAbort, { once: true });
       let fallback: Promise<void> | null = null;
-      const startFallback = () => {
-        if (fallbackStarted || settled) return;
-        fallbackStarted = true;
-        fallback = (async () => {
-          try {
-            const response = await input.connection.getSignatureStatus(input.strategy.signature);
-            const result = fallbackConfirmationResult(response);
-            if (result) settle(result);
-          } catch (error) {
-            if (isOwnedAbort(error, confirmation.signal)) return;
-            if (settled) {
-              // A subscription already supplied the result. This late fallback
-              // error cannot change it, but must remain observable exactly once.
-              (input.reportUnexpectedFallbackError ?? console.error)(formatConfirmationFallbackError(error));
-            } else {
-              settle(undefined, error);
-            }
-          }
-        })();
-      };
       try {
         try {
           subscriptionId = input.connection.onSignature(
@@ -316,13 +316,62 @@ export async function confirmConnectionTransaction(input: {
           confirmation.signal.removeEventListener("abort", onAbort);
           throw error;
         }
-        if (input.connection._onSubscriptionStateChange) {
-          disposeSubscriptionStateObserver = input.connection._onSubscriptionStateChange(subscriptionId, (state) => {
-            if (state === "subscribed") startFallback();
-          });
-        } else {
-          startFallback();
-        }
+        // Poll throughout the bounded observation window. The previous
+        // one-shot fallback could read null before the transaction landed and
+        // then depend entirely on one websocket notification for the next
+        // eight seconds. Missing that notification produced a false timeout.
+        fallback = (async () => {
+          let pollCount = 0;
+          try {
+            while (!settled && !confirmation.signal.aborted) {
+              const response = await input.connection.getSignatureStatus(input.strategy.signature);
+              const result = fallbackConfirmationResult(response);
+              if (result) {
+                settle(result);
+                return;
+              }
+
+              pollCount += 1;
+              const shouldCheckExpiry = pollCount === 1 || pollCount % 4 === 0;
+              if (shouldCheckExpiry && input.connection.getBlockHeight) {
+                const blockHeight = await input.connection.getBlockHeight("confirmed");
+                if (blockHeight > input.strategy.lastValidBlockHeight) {
+                  if (!input.connection.getSignatureStatuses) {
+                    settle(undefined, new KeeperFailure("expired", "keeper transaction expired without a confirmed result"));
+                    return;
+                  }
+                  const historical = historicalConfirmationResult(await input.connection.getSignatureStatuses(
+                    [input.strategy.signature],
+                    { searchTransactionHistory: true },
+                  ));
+                  if (historical.result) {
+                    settle(historical.result);
+                    return;
+                  }
+                  if (!historical.found) {
+                    settle(undefined, new KeeperFailure("expired", "keeper transaction expired without landing"));
+                    return;
+                  }
+                  // A processed status proves the transaction landed before
+                  // expiry but has not reached confirmed commitment. Keep the
+                  // same signature pending; never sign a replacement.
+                }
+              }
+              await abortableSleep(input.pollIntervalMs ?? 400, confirmation.signal, clock);
+            }
+          } catch (error) {
+            const ownedCancellation = isOwnedAbort(error, confirmation.signal)
+              || (confirmation.signal.aborted
+                && error instanceof KeeperFailure
+                && error.kind === "cancelled");
+            if (ownedCancellation) return;
+            if (settled) {
+              (input.reportUnexpectedFallbackError ?? console.error)(formatConfirmationFallbackError(error));
+            } else {
+              settle(undefined, error);
+            }
+          }
+        })();
         const result = await outcome;
         return result;
       } finally {
@@ -330,7 +379,6 @@ export async function confirmConnectionTransaction(input: {
         // actual fallback promise. This leaves neither a detached rejection nor
         // live HTTP work after a successful subscription confirmation.
         abortOwned(confirmation, "keeper transaction confirmation completed");
-        disposeSubscriptionStateObserver?.();
         if (subscriptionId !== null && !subscriptionDelivered) {
           try {
             await input.connection.removeSignatureListener(subscriptionId);
@@ -346,10 +394,10 @@ export async function confirmConnectionTransaction(input: {
     if (normalized) return normalized;
     if (isOwnedAbort(error, confirmation.signal)) {
       throw new KeeperFailure(
-        input.parentSignal.aborted ? "cancelled" : "timeout",
+        input.parentSignal.aborted ? "cancelled" : "pending",
         input.parentSignal.aborted
           ? "keeper transaction confirmation cancelled"
-          : "keeper transaction confirmation timed out",
+          : "keeper transaction remains pending after the observation window",
       );
     }
     throw error;
@@ -358,6 +406,85 @@ export async function confirmConnectionTransaction(input: {
     abortOwned(confirmation, "keeper transaction confirmation completed");
     clock.clearTimeout(timeout);
     linked.dispose();
+  }
+}
+
+export interface PendingSignedBroadcast<TContext> {
+  context: TContext;
+  rawTransaction: Uint8Array;
+  strategy: ConfirmationStrategy;
+}
+
+/**
+ * Retain one signed transaction until the cluster gives a terminal answer.
+ * A retry may rebroadcast the exact same bytes (and therefore the same
+ * signature), but `record` fails closed while any earlier transaction is
+ * unresolved. This prevents a short observation failure from becoming a
+ * second, independently signed state transition.
+ */
+export class PendingBroadcastGate<TContext> {
+  private pending: PendingSignedBroadcast<TContext> | null = null;
+
+  hasPending(): boolean {
+    return this.pending !== null;
+  }
+
+  snapshot(): Omit<PendingSignedBroadcast<TContext>, "rawTransaction"> | null {
+    return this.pending
+      ? { context: this.pending.context, strategy: { ...this.pending.strategy } }
+      : null;
+  }
+
+  record(input: PendingSignedBroadcast<TContext>): void {
+    if (this.pending) {
+      throw new KeeperFailure("pending", "an earlier keeper transaction still requires reconciliation");
+    }
+    this.pending = {
+      context: input.context,
+      rawTransaction: Uint8Array.from(input.rawTransaction),
+      strategy: { ...input.strategy },
+    };
+  }
+
+  async reconcile(input: {
+    confirm(strategy: ConfirmationStrategy): Promise<unknown>;
+    rebroadcast?(rawTransaction: Uint8Array): Promise<string>;
+    reportRebroadcastError?(message: string): void;
+    signal?: AbortSignal;
+  }): Promise<{ context: TContext; result: unknown; strategy: ConfirmationStrategy } | null> {
+    const pending = this.pending;
+    if (!pending) return null;
+
+    if (input.rebroadcast) {
+      let signature: string | null = null;
+      try {
+        signature = await input.rebroadcast(Uint8Array.from(pending.rawTransaction));
+      } catch (error) {
+        const failure = classifyKeeperError(error, input.signal);
+        if (failure.kind === "cancelled") throw failure;
+        (input.reportRebroadcastError ?? console.error)(
+          `[keeper rebroadcast] ${safeErrorMessage(failure).slice(0, 140)}`,
+        );
+        // Submission acknowledgement is not authoritative. Continue checking
+        // the locally derived signature because the original or this retry may
+        // already have reached the cluster.
+      }
+      if (signature !== null && signature !== pending.strategy.signature) {
+        throw new KeeperFailure("pending", "identical keeper rebroadcast returned a different signature");
+      }
+    }
+
+    try {
+      const result = await input.confirm(pending.strategy);
+      this.pending = null;
+      return { context: pending.context, result, strategy: { ...pending.strategy } };
+    } catch (error) {
+      const failure = classifyKeeperError(error, input.signal);
+      // Only block-height expiry plus a final history miss proves that these
+      // signed bytes can no longer change authoritative state.
+      if (failure.kind === "expired") this.pending = null;
+      throw failure;
+    }
   }
 }
 
@@ -428,7 +555,7 @@ export class RpcCircuitBreaker {
   }
 
   recordFailure(failure: KeeperFailure): number | null {
-    if (failure.kind !== "rate_limit" && failure.kind !== "transport" && failure.kind !== "timeout") return null;
+    if (failure.kind !== "expired" && failure.kind !== "rate_limit" && failure.kind !== "transport" && failure.kind !== "timeout") return null;
     this.state.failures += 1;
     const base = failure.kind === "rate_limit" ? this.rateLimitBaseMs : this.transportBaseMs;
     const exponential = Math.min(base * 2 ** Math.min(this.state.failures - 1, 5), this.maxBackoffMs);

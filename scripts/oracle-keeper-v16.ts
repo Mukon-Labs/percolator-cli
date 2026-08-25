@@ -28,6 +28,7 @@ import {
   TransactionInstruction, ComputeBudgetProgram,
 } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import bs58 from "bs58";
 import {
   abortableSleep,
   classifyKeeperError,
@@ -43,6 +44,7 @@ import {
   marketRecoveryStatusProbeDue,
   parseRecoveryClockLagSlots,
   parseKeeperSecretKey,
+  PendingBroadcastGate,
   PushWatchdog,
   RpcCircuitBreaker,
   RpcOperationSignalScope,
@@ -56,6 +58,7 @@ import {
   SingleTickRunner,
   systemClock,
   retryAfterMs,
+  type ConfirmationStrategy,
   type V16RecoveryStatus,
 } from "./keeper-runtime.ts";
 import {
@@ -109,6 +112,7 @@ const TICK_DEADLINE_MS = 20_000;   // hard cap on one tick, releases the guard
 const WATCHDOG_MS = 150_000;       // no successful push for this long -> exit(1)
 const WATCHDOG_FORCE_EXIT_MS = 10_000;
 const TX_TIMEOUT_MS = 8000;
+const PENDING_WATCHDOG_GRACE_MS = 120_000;
 const MAX_BACKOFF_MS = 30_000;
 const MARKET_STATUS_CHECK_MS = 30_000;
 const MARKET_MAX_CLOCK_LAG_SLOTS = parseRecoveryClockLagSlots(
@@ -150,6 +154,8 @@ const conn = new Connection(RPC_URL, {
   }),
 });
 const payer = loadKeypair();
+type PendingKeeperAction = KeeperAction | "crank-buffer-create";
+const pendingBroadcasts = new PendingBroadcastGate<{ action: PendingKeeperAction }>();
 let crankBuffer: PublicKey; // legless portfolio used only for catch-up cranks
 let shadowCrankBufferUsable = false;
 
@@ -192,6 +198,44 @@ function ixCrank(portfolio: PublicKey, assetIndexes: number[], nowSlot: bigint):
   });
 }
 
+function confirmKeeperTransaction(strategy: ConfirmationStrategy, signal: AbortSignal): Promise<unknown> {
+  return confirmConnectionTransaction({
+    connection: conn,
+    parentSignal: signal,
+    runWithOperationSignal: (operationSignal, work) => rpcOperationSignals.run(operationSignal, work),
+    reportUnexpectedFallbackError: (message) => console.error(`  ${message}`),
+    strategy,
+    timeoutMs: TX_TIMEOUT_MS,
+  });
+}
+
+async function reconcilePendingBroadcast(signal: AbortSignal): Promise<void> {
+  const pending = pendingBroadcasts.snapshot();
+  if (!pending) return;
+  const resolved = await pendingBroadcasts.reconcile({
+    confirm: (strategy) => confirmKeeperTransaction(strategy, signal),
+    rebroadcast: (rawTransaction) => conn.sendRawTransaction(Buffer.from(rawTransaction), {
+      skipPreflight: true,
+      maxRetries: 0,
+    }),
+    reportRebroadcastError: (message) => console.error(`  ${message}`),
+    signal,
+  });
+  if (!resolved) return;
+  const err = confirmedTransactionError(resolved.result);
+  const signaturePrefix = resolved.strategy.signature.slice(0, 8);
+  if (err === null) {
+    console.log(`  reconciled ${resolved.context.action} ${signaturePrefix}… at confirmed commitment`);
+    if (resolved.context.action === "oracle-push") {
+      watchdog.recordConfirmedPush(Date.now(), true);
+      watchdogSuppressedUntil = 0;
+      rpcCircuit.recordConfirmedSuccess();
+    }
+  } else {
+    console.error(`  reconciled ${resolved.context.action} ${signaturePrefix}… with an on-chain rejection`);
+  }
+}
+
 async function withRpcSignal<T>(signal: AbortSignal, work: () => Promise<T>): Promise<T> {
   if (signal.aborted) throw new KeeperFailure("cancelled", "keeper RPC work cancelled");
   if (rpcOperationSignals.currentSignal()) {
@@ -216,6 +260,7 @@ async function sendIxs(
   intent?: { action: KeeperAction; assetIndexes: readonly number[]; observedSlot: bigint },
 ): Promise<{ sig: string; err: unknown | null; confirmed: boolean }> {
   if (signal.aborted) throw new Error("keeper operation cancelled");
+  if (KEEPER_MODE === "live") await reconcilePendingBroadcast(signal);
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
   if (signal.aborted) throw new Error("keeper operation cancelled");
   const tx = new Transaction();
@@ -228,6 +273,10 @@ async function sendIxs(
   ];
   tx.add(...plannedIxs);
   tx.sign(payer);
+  const rawTransaction = tx.serialize();
+  const localSignature = tx.signature;
+  if (!localSignature) throw new KeeperFailure("unknown", "signed keeper transaction has no payer signature");
+  const derivedSignature = bs58.encode(localSignature);
 
   if (KEEPER_MODE === "shadow" && (!intent || !shadowDecisionLog)) {
     throw new KeeperFailure("unknown", "shadow keeper send intent is missing");
@@ -258,21 +307,27 @@ async function sendIxs(
     },
     broadcast: async () => {
       if (signal.aborted) throw new KeeperFailure("cancelled", "keeper transaction submission cancelled");
-      const sig = await conn.sendRawTransaction(tx.serialize(), {
+      const action = intent?.action ?? "crank-buffer-create";
+      pendingBroadcasts.record({
+        context: { action },
+        rawTransaction,
+        strategy: { signature: derivedSignature, blockhash, lastValidBlockHeight },
+      });
+      const sig = await conn.sendRawTransaction(rawTransaction, {
         skipPreflight: true,
         maxRetries: 0,
       });
+      if (sig !== derivedSignature) {
+        throw new KeeperFailure("pending", "keeper submission returned a different signature");
+      }
       // Confirmation owns and settles all fallback work before this tick can
       // release its single-flight signal.
-      const result = await confirmConnectionTransaction({
-        connection: conn,
-        parentSignal: signal,
-        runWithOperationSignal: (operationSignal, work) => rpcOperationSignals.run(operationSignal, work),
-        reportUnexpectedFallbackError: (message) => console.error(`  ${message}`),
-        strategy: { signature: sig, blockhash, lastValidBlockHeight },
-        timeoutMs: TX_TIMEOUT_MS,
+      const resolved = await pendingBroadcasts.reconcile({
+        confirm: (strategy) => confirmKeeperTransaction(strategy, signal),
+        signal,
       });
-      return { sig, err: confirmedTransactionError(result), confirmed: true };
+      if (!resolved) throw new KeeperFailure("unknown", "keeper pending broadcast disappeared before confirmation");
+      return { sig, err: confirmedTransactionError(resolved.result), confirmed: true };
     },
   });
   if (execution.mode === "live") return execution.value;
@@ -747,8 +802,20 @@ async function tick() {
     const started = await tickRunner.run((signal) => withRpcSignal(signal, () => tickInner(signal)));
     if (!started) return;
   } catch (err: unknown) {
-    consecutiveErrors++;
     const failure = classifyKeeperError(err);
+    if (failure.kind === "pending") {
+      const pending = pendingBroadcasts.snapshot();
+      const label = pending
+        ? `${pending.context.action} ${pending.strategy.signature.slice(0, 8)}…`
+        : "keeper transaction";
+      watchdogSuppressedUntil = Math.max(
+        watchdogSuppressedUntil,
+        Date.now() + PENDING_WATCHDOG_GRACE_MS,
+      );
+      console.error(`  ${label} is still pending; replacement signing is blocked`);
+      return;
+    }
+    consecutiveErrors++;
     console.error(`  [${new Date().toISOString().slice(11, 19)}] Error #${consecutiveErrors}: ${safeErrorMessage(failure).slice(0, 140)}`);
     const circuitBackoff = rpcCircuit.recordFailure(failure);
     if (circuitBackoff !== null) {
@@ -799,6 +866,19 @@ async function boot(): Promise<void> {
       break;
     } catch (error) {
       const failure = classifyKeeperError(error);
+      if (failure.kind === "pending") {
+        const pending = pendingBroadcasts.snapshot();
+        const label = pending
+          ? `${pending.context.action} ${pending.strategy.signature.slice(0, 8)}…`
+          : "keeper transaction";
+        watchdogSuppressedUntil = Math.max(
+          watchdogSuppressedUntil,
+          Date.now() + PENDING_WATCHDOG_GRACE_MS,
+        );
+        console.error(`boot ${label} is still pending; waiting to reconcile`);
+        await abortableSleep(PUSH_INTERVAL_MS, shutdown.signal);
+        continue;
+      }
       const backoff = rpcCircuit.recordFailure(failure);
       if (backoff === null) throw failure;
       watchdogSuppressedUntil = Date.now() + backoff + WATCHDOG_MS;

@@ -33,6 +33,7 @@ import {
   modelCatchupCadence,
   parseKeeperSecretKey,
   parseRecoveryClockLagSlots,
+  PendingBroadcastGate,
   PushWatchdog,
   readV16LossStaleActive,
   readV16RecoveryStatus,
@@ -423,7 +424,6 @@ async function runRealConnectionFallbackRace(kind: "owner" | "independent-abort"
   let activeFallbacks = 0;
   let unsubscribeCalls = 0;
   const ignoredUnsubscribeWarnings: string[] = [];
-  let onSubscribed!: (state: string) => void;
   let deliverSubscription!: (result: { err: unknown }, context: unknown) => void;
   const customFetch: typeof fetch = (_url, init) => new Promise<Response>((_resolve, reject) => {
     activeFallbacks += 1;
@@ -446,7 +446,6 @@ async function runRealConnectionFallbackRace(kind: "owner" | "independent-abort"
       signal: scope.currentSignal() ?? options?.signal,
     }),
   }) as unknown as {
-    _onSubscriptionStateChange: (id: number, callback: (state: string) => void) => () => void;
     getSignatureStatus: (signature: string) => Promise<unknown>;
     onSignature: (signature: string, callback: (result: { err: unknown }, context: unknown) => void, commitment: "confirmed") => number;
     removeSignatureListener: (id: number) => Promise<void>;
@@ -462,10 +461,6 @@ async function runRealConnectionFallbackRace(kind: "owner" | "independent-abort"
       void connection.removeSignatureListener(7);
     };
     return 7;
-  };
-  connection._onSubscriptionStateChange = (_id, callback) => {
-    onSubscribed = callback;
-    return () => undefined;
   };
   const reports: string[] = [];
   const unhandled: unknown[] = [];
@@ -484,8 +479,6 @@ async function runRealConnectionFallbackRace(kind: "owner" | "independent-abort"
       strategy: { signature: "sig", blockhash: "blockhash", lastValidBlockHeight: 1 },
       timeoutMs: 8_000,
     });
-    await flush();
-    onSubscribed("subscribed");
     await flush();
     assert.equal(activeFallbacks, 1);
     deliverSubscription({ err: null }, { slot: 1 });
@@ -517,6 +510,163 @@ test("real Connection custom-fetch fallback reports independent abort and transp
     await runRealConnectionFallbackRace("transport"),
     [formatConfirmationFallbackError(new Error("connection reset https://provider.invalid/key"))],
   );
+});
+
+test("confirmation polling survives an early null and a missed websocket notification", async () => {
+  const clock = fakeClock();
+  const statuses = [
+    { context: { slot: 1 }, value: null },
+    { context: { slot: 2 }, value: { err: null, confirmationStatus: "processed" } },
+    { context: { slot: 3 }, value: { err: null, confirmationStatus: "confirmed" } },
+  ];
+  let reads = 0;
+  const confirmation = confirmConnectionTransaction({
+    clock,
+    connection: {
+      getSignatureStatus: async () => statuses[Math.min(reads++, statuses.length - 1)],
+      onSignature: () => 1,
+      removeSignatureListener: async () => undefined,
+    },
+    parentSignal: new AbortController().signal,
+    pollIntervalMs: 400,
+    runWithOperationSignal: async (_signal, work) => work(),
+    strategy: { signature: "sig", blockhash: "blockhash", lastValidBlockHeight: 100 },
+    timeoutMs: 8_000,
+  });
+
+  for (let poll = 0; poll < 2; poll += 1) {
+    await flush();
+    const sleep = clock.tasks.find((task) => !task.cancelled && task.delayMs === 400);
+    assert.ok(sleep);
+    sleep.cancelled = true;
+    sleep.callback();
+  }
+  assert.deepEqual(await confirmation, { context: { slot: 3 }, value: { err: null } });
+  assert.equal(reads, 3);
+});
+
+test("processed polling errors remain pending until confirmed commitment", async () => {
+  const clock = fakeClock();
+  const error = { InstructionError: [2, { Custom: 21 }] };
+  const statuses = [
+    { context: { slot: 2 }, value: { err: error, confirmationStatus: "processed" } },
+    { context: { slot: 3 }, value: { err: error, confirmationStatus: "confirmed" } },
+  ];
+  let reads = 0;
+  const confirmation = confirmConnectionTransaction({
+    clock,
+    connection: {
+      getSignatureStatus: async () => statuses[Math.min(reads++, statuses.length - 1)],
+      onSignature: () => 1,
+      removeSignatureListener: async () => undefined,
+    },
+    parentSignal: new AbortController().signal,
+    pollIntervalMs: 400,
+    runWithOperationSignal: async (_signal, work) => work(),
+    strategy: { signature: "sig", blockhash: "blockhash", lastValidBlockHeight: 100 },
+    timeoutMs: 8_000,
+  });
+  await flush();
+  const sleep = clock.tasks.find((task) => !task.cancelled && task.delayMs === 400);
+  assert.ok(sleep);
+  sleep.cancelled = true;
+  sleep.callback();
+  assert.deepEqual(confirmedTransactionError(await confirmation), error);
+  assert.equal(reads, 2);
+});
+
+test("expiry performs a final history lookup before declaring non-landing", async () => {
+  const makeConnection = (historicalStatus: unknown) => ({
+    getBlockHeight: async () => 101,
+    getSignatureStatus: async () => ({ context: { slot: 10 }, value: null }),
+    getSignatureStatuses: async () => ({ context: { slot: 11 }, value: [historicalStatus] }),
+    onSignature: () => 1,
+    removeSignatureListener: async () => undefined,
+  });
+
+  const late = await confirmConnectionTransaction({
+    clock: fakeClock(),
+    connection: makeConnection({ err: null, confirmationStatus: "confirmed" }),
+    parentSignal: new AbortController().signal,
+    runWithOperationSignal: async (_signal, work) => work(),
+    strategy: { signature: "sig", blockhash: "blockhash", lastValidBlockHeight: 100 },
+    timeoutMs: 8_000,
+  });
+  assert.deepEqual(late, { context: { slot: 11 }, value: { err: null } });
+
+  await assert.rejects(
+    confirmConnectionTransaction({
+      clock: fakeClock(),
+      connection: makeConnection(null),
+      parentSignal: new AbortController().signal,
+      runWithOperationSignal: async (_signal, work) => work(),
+      strategy: { signature: "sig", blockhash: "blockhash", lastValidBlockHeight: 100 },
+      timeoutMs: 8_000,
+    }),
+    (error: unknown) => error instanceof KeeperFailure && error.kind === "expired",
+  );
+});
+
+test("pending broadcast gate rebroadcasts identical bytes and blocks replacement signing", async () => {
+  const gate = new PendingBroadcastGate<{ action: string }>();
+  const pending = {
+    context: { action: "oracle-push" },
+    rawTransaction: Uint8Array.from([1, 2, 3]),
+    strategy: { signature: "same-signature", blockhash: "blockhash", lastValidBlockHeight: 100 },
+  };
+  gate.record(pending);
+  assert.throws(() => gate.record(pending), (error: unknown) => error instanceof KeeperFailure && error.kind === "pending");
+
+  let rebroadcasts = 0;
+  await assert.rejects(
+    gate.reconcile({
+      confirm: async () => { throw new KeeperFailure("pending", "not terminal"); },
+      rebroadcast: async (raw) => {
+        rebroadcasts += 1;
+        assert.deepEqual([...raw], [1, 2, 3]);
+        return "same-signature";
+      },
+    }),
+    (error: unknown) => error instanceof KeeperFailure && error.kind === "pending",
+  );
+  assert.equal(gate.hasPending(), true);
+
+  const resolved = await gate.reconcile({
+    confirm: async () => ({ context: { slot: 12 }, value: { err: null } }),
+    rebroadcast: async (raw) => {
+      rebroadcasts += 1;
+      assert.deepEqual([...raw], [1, 2, 3]);
+      return "same-signature";
+    },
+  });
+  assert.equal(rebroadcasts, 2);
+  assert.equal(resolved?.context.action, "oracle-push");
+  assert.equal(resolved?.strategy.signature, "same-signature");
+  assert.equal(gate.hasPending(), false);
+
+  gate.record(pending);
+  await assert.rejects(
+    gate.reconcile({ confirm: async () => { throw new KeeperFailure("expired", "history miss"); } }),
+    (error: unknown) => error instanceof KeeperFailure && error.kind === "expired",
+  );
+  assert.equal(gate.hasPending(), false, "only proven expiry permits a replacement transaction");
+});
+
+test("pending broadcast gate fails closed when identical bytes produce a different signature", async () => {
+  const gate = new PendingBroadcastGate<{ action: string }>();
+  gate.record({
+    context: { action: "lp-crank" },
+    rawTransaction: Uint8Array.from([9]),
+    strategy: { signature: "expected", blockhash: "blockhash", lastValidBlockHeight: 100 },
+  });
+  await assert.rejects(
+    gate.reconcile({
+      confirm: async () => ({ context: {}, value: { err: null } }),
+      rebroadcast: async () => "different",
+    }),
+    (error: unknown) => error instanceof KeeperFailure && error.kind === "pending",
+  );
+  assert.equal(gate.hasPending(), true);
 });
 
 test("confirmation timeout and shutdown abort owned fallback work without orphaning a runner", async () => {
@@ -554,7 +704,7 @@ test("confirmation timeout and shutdown abort owned fallback work without orphan
   const confirmationTimeout = clock.tasks.find((task) => task.delayMs === 8_000);
   assert.ok(confirmationTimeout);
   confirmationTimeout.callback();
-  await assert.rejects(first, (error: unknown) => error instanceof KeeperFailure && error.kind === "timeout");
+  await assert.rejects(first, (error: unknown) => error instanceof KeeperFailure && error.kind === "pending");
   assert.equal(unresolvedCalls, 0);
   assert.equal(scope.currentSignal(), null);
   assert.equal(runner.isActive(), false);
