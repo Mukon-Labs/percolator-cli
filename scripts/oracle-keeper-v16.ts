@@ -164,6 +164,18 @@ const pendingBroadcasts = new PendingBroadcastGate<{ action: PendingKeeperAction
 let crankBuffer: PublicKey; // legless portfolio used only for catch-up cranks
 let shadowCrankBufferUsable = false;
 
+function releaseMetadata(name: string, fallback: string): string {
+  const value = process.env[name]?.trim() || fallback;
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(value)) {
+    throw new KeeperFailure("unknown", `${name} has an invalid format`);
+  }
+  return value;
+}
+
+const RELEASE_SOURCE = releaseMetadata("NINJA_RELEASE_SOURCE", "local");
+const RELEASE_ID = releaseMetadata("NINJA_RELEASE_ID", "local");
+let releasePushProofLogged = false;
+
 // PushAuthMark (tag 63): [63, asset_index:u16, now_slot:u64, mark_e6:u64]
 function ixPushAuthMark(assetIndex: number, nowSlot: bigint, markE6: bigint): TransactionInstruction {
   const d = Buffer.alloc(1 + 2 + 8 + 8);
@@ -588,6 +600,7 @@ console.log(`  Active feeds: ${KEEPER_ASSETS.map((a) => `${a.index}=${a.symbol}`
 console.log("  Unavailable:  3=ZEC (Coming Soon; no provider entitlement)");
 console.log(`  Auth:    ${payer.publicKey.toBase58()}`);
 console.log(`  Mode:    ${KEEPER_MODE}`);
+console.log(`  Release: ${RELEASE_SOURCE} (${RELEASE_ID})`);
 console.log(`  Recovery clock bound: ${MARKET_MAX_CLOCK_LAG_SLOTS} slots`);
 console.log(`  Push:    every ${PUSH_INTERVAL_MS}ms\n`);
 
@@ -781,6 +794,14 @@ async function tickInner(signal: AbortSignal) {
   if (push.confirmed) {
     watchdog.recordConfirmedPush(Date.now(), true);
     watchdogSuppressedUntil = 0;
+    if (!releasePushProofLogged) {
+      releasePushProofLogged = true;
+      console.log(`NINJA_KEEPER_HEALTH ${JSON.stringify({
+        event: "confirmed-push",
+        releaseId: RELEASE_ID,
+        source: RELEASE_SOURCE,
+      })}`);
+    }
   }
   if (shouldResetRpcCircuitAfterPush(KEEPER_MODE, push.confirmed)) {
     rpcCircuit.recordConfirmedSuccess();

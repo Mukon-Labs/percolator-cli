@@ -223,8 +223,10 @@ export interface V16MarketHealthAssessment extends V16MarketHealthSnapshot {
 export interface V16MarketHealthOptions {
   expectedDomainInsurance?: bigint;
   maxClockLagSlots?: bigint;
+  minimumDomainInsurance?: bigint;
   minimumLpRiskEquity?: bigint;
   requireAuthorityParity?: boolean;
+  requireFullSourceCredit?: boolean;
 }
 
 function assetBase(asset: number): number {
@@ -419,6 +421,9 @@ export function assessV16MarketHealth(
   if (options.expectedDomainInsurance !== undefined && options.expectedDomainInsurance < 0n) {
     fail("expected domain insurance cannot be negative");
   }
+  if (options.minimumDomainInsurance !== undefined && options.minimumDomainInsurance < 0n) {
+    fail("minimum domain insurance cannot be negative");
+  }
   if (options.maxClockLagSlots !== undefined && options.maxClockLagSlots < 0n) {
     fail("maximum clock lag cannot be negative");
   }
@@ -476,6 +481,10 @@ export function assessV16MarketHealth(
     && snapshot.domainInsurance !== options.expectedDomainInsurance) {
     criticalReasons.push("domain insurance does not equal the configured target");
   }
+  if (options.minimumDomainInsurance !== undefined
+    && snapshot.domainInsurance < options.minimumDomainInsurance) {
+    criticalReasons.push("domain insurance is below the configured operational floor");
+  }
   for (const asset of snapshot.assets) {
     if (options.requireAuthorityParity && !asset.authorityParity) {
       criticalReasons.push(`asset ${asset.asset} delegated authorities do not match market authority`);
@@ -511,8 +520,12 @@ export function assessV16MarketHealth(
     if (domain.backingStatus !== BACKING_FRESH || domain.backingExpiry <= snapshot.marketCurrentSlot) {
       criticalReasons.push(`insurance domain ${domain.domain} backing is not fresh`);
     }
-    if (domain.creditRate !== CREDIT_RATE_ONE) {
-      criticalReasons.push(`insurance domain ${domain.domain} source credit rate is not 1`);
+    if (domain.creditRate > CREDIT_RATE_ONE) {
+      invalidReasons.push(`insurance domain ${domain.domain} source credit rate exceeds 1`);
+    } else if (domain.creditRate !== CREDIT_RATE_ONE) {
+      const reason = `insurance domain ${domain.domain} source credit rate is not 1`;
+      if (options.requireFullSourceCredit ?? true) criticalReasons.push(reason);
+      else warningReasons.push(reason);
     }
   }
   if (options.maxClockLagSlots !== undefined) {

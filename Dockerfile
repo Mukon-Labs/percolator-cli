@@ -1,6 +1,11 @@
 # Oracle keeper — a small always-on worker (no HTTP service).
 FROM node:22-slim
 
+ARG NINJA_RELEASE_SOURCE=local
+ARG NINJA_RELEASE_ID=local
+ENV NINJA_RELEASE_SOURCE=${NINJA_RELEASE_SOURCE}
+ENV NINJA_RELEASE_ID=${NINJA_RELEASE_ID}
+
 WORKDIR /app
 
 # Install deps first for layer caching. Install from package.json (not `npm ci`)

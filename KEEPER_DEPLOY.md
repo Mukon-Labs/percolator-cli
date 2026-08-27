@@ -35,7 +35,7 @@ credential. Prepare and enter it locally; never paste it into chat or source.
 > only role is oracle authority (`set-oracle-authority`), so a host compromise
 > can't touch LP capital or the upgrade authority.
 
-## 3. Existing-machine update or resume only
+## 3. Continuous existing-machine promotion or emergency resume
 
 This runbook assumes the named Fly app and its keeper machine already exist.
 It does not authorize creating an app or machine, scaling, cloning, or high
@@ -47,7 +47,8 @@ cd /path/to/Mukon-Perps/percolator-cli
 # Read-only: expect zero local keeper processes.
 pgrep -fal '[o]racle-keeper-v16|[p]npm.*[[:space:]]keeper([[:space:]]|$)' || true
 
-# Read-only: expect exactly one hosted keeper machine, currently stopped.
+# Read-only: expect exactly one hosted keeper machine. It must be started for a
+# normal promotion; stopped is valid only for a separately authorized resume.
 fly machine list -a ninja-oracle-keeper
 
 # Read-only names-only check; never paste or inspect secret values.
@@ -61,28 +62,37 @@ command, source, logs or chat. Re-run the names-only `fly secrets list` check
 afterward. This is a mutation, not part of this read-only runbook check. Do not
 use `fly scale count` as singleton verification.
 
-After review and fresh authorization, choose one operation deliberately:
+Normal code promotion uses only the protected GitHub workflow documented in
+`FLY_RELEASE.md`. It requires the singleton to be **started**, builds and pins
+the candidate while the old process remains live, rechecks the exact old
+source/image immediately before promotion, updates only that Machine, and
+requires a release-specific confirmed oracle push plus an operational audit.
+The dispatch must also pre-authorize one exact-image rollback; a failed
+candidate either proves the old image was never displaced or restores it and
+proves a fresh write.
 
-- Deploy the staged release to the verified existing machine only:
-  `fly deploy -a ninja-oracle-keeper --ha=false --update-only --only-machines <verified-existing-machine-id> --strategy immediate`.
-  This is not a read-only resume.
-- `fly machine start <id> -a ninja-oracle-keeper` is resume-only and is valid
-  only when the current staged/applied secret names already apply to that
-  verified stopped machine.
+Do not stage a normal keeper release on a stopped Machine. A stopped keeper
+freezes the market clock while cluster slots continue, turning the outage into
+future bounded-recovery debt.
 
-Neither operation may create a new machine or HA replica. Re-run the checks
-above after an authorized operation.
+`fly machine start <id> -a ninja-oracle-keeper` is an emergency resume-only
+operation. It is valid only after a separate authorization and a fresh
+singleton, source/image, signer-role, RPC-circuit and market-health preflight.
+It is not part of the release workflow.
+
+Neither path may create a new Machine or HA replica. Program/config/secret
+changes remain separate work packages; the continuous workflow promotes only
+the reviewed image and non-secret release metadata.
 
 ## 4. Verify
 
-```bash
-fly logs
-```
-
-should show ticks like:
+The protected workflow performs the hosted postcheck. For a separately
+authorized read-only inspection, bounded Machine-specific logs should show the
+release marker followed by normal ticks:
 
 ```
-[12:20:30] SOL $80.77✓  BTC $61579.57✓  ETH $1721.38✓  ZEC $…✓
+NINJA_KEEPER_HEALTH {"event":"confirmed-push",...}
+[12:20:30] SOL $80.77  BTC $61579  ETH $1721 push+crank ✓ ...
 ```
 
 Fly restarts the machine if the process exits. The keeper owns bounded retry,
@@ -120,6 +130,12 @@ preflight. `LP_MIN_CAPITAL_USDC` controls the warning floor only and defaults to
 existing bounded legless-buffer recovery: catch-up continues while loss-stale
 is active or an active/drain-only asset exceeds that limit, then the keeper
 caches the settled state and stops the extra status read/recovery work.
+`AUDIT_PROFILE=recovery` keeps the exact incident-recovery snapshot gate.
+Continuous releases set `AUDIT_PROFILE=operational` and require explicit
+positive `LP_MIN_RISK_EQUITY_USDC` and `MIN_DOMAIN_INSURANCE_USDC` floors; see
+`FLY_RELEASE.md`. `NINJA_RELEASE_SOURCE` and `NINJA_RELEASE_ID` are non-secret
+image build metadata set by the protected workflow. Operators must not
+override them in runtime secret stores.
 
 ## Local dev
 

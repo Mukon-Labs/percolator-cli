@@ -2,8 +2,9 @@
 # A worker process (no inbound HTTP), so there is no [http_service] block.
 #
 # Existing-singleton update only: do not create, clone, scale, or add HA.
-# Before any authorized deploy/resume, verify names-only secret presence, zero
-# local keeper processes, and exactly one stopped hosted keeper machine.
+# Normal image promotion requires exactly one STARTED hosted keeper and runs
+# only through the protected continuous-release workflow. A stopped Machine is
+# an emergency resume gate, never a normal staging state.
 # After review, the operator stages secrets only with `fly secrets set --stage`;
 # values never belong here. Fresh deployment authorization then uses:
 # `fly deploy -a ninja-oracle-keeper --ha=false --update-only --only-machines <id> --strategy immediate`.
@@ -23,8 +24,9 @@ primary_region = "iad"
   # Non-secret defaults. RPC_URL and KEEPER_SECRET_KEY come from `fly secrets`.
   # PROGRAM_ID defaults to the deployed v16 program in the code.
 
-# One intended keeper only. Deploy changes the existing release; starting the
-# verified stopped machine is a separate, authorized resume operation.
+# One intended keeper only. The workflow builds while it runs, then performs a
+# bounded exact-Machine update and readiness proof. Starting an already-stopped
+# Machine remains a separate, authorized emergency resume operation.
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"

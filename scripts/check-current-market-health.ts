@@ -21,11 +21,11 @@ import {
 import {
   assessV16MarketHealth,
   formatV16MarketHealth,
-  parseUsdcAmount,
   parseUsdcFloor,
   readV16MarketCollateralMint,
   readV16MarketHealthSnapshot,
 } from "./v16-market-health.ts";
+import { resolveV16AuditProfile } from "./v16-audit-profile.ts";
 
 const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID ?? "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq",
@@ -37,22 +37,6 @@ const LP_PORTFOLIO = new PublicKey(
   process.env.LP_PORTFOLIO ?? "BWqxjf1GoYqRNZTy6h1txPxBtiiN9MyF5Hd2JtKYGVwS",
 );
 
-function parseSlotLimit(value: string | undefined, fallback: bigint): bigint {
-  const normalized = value?.trim() || fallback.toString();
-  if (!/^\d+$/.test(normalized)) {
-    throw new Error("MARKET_MAX_CLOCK_LAG_SLOTS must be a non-negative integer");
-  }
-  return BigInt(normalized);
-}
-
-function parseStrictBoolean(value: string | undefined, fallback: boolean): boolean {
-  const normalized = value?.trim().toLowerCase();
-  if (!normalized) return fallback;
-  if (normalized === "true" || normalized === "1") return true;
-  if (normalized === "false" || normalized === "0") return false;
-  throw new Error("REQUIRE_AUTHORITY_PARITY must be true, false, 1, or 0");
-}
-
 function safeSlotNumber(value: bigint): number {
   if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new Error("RPC context slot is outside the safe integer range");
@@ -63,6 +47,7 @@ function safeSlotNumber(value: bigint): number {
 async function main(): Promise<void> {
   const rpcUrl = process.env.RPC_URL?.trim();
   if (!rpcUrl) throw new Error("RPC_URL is required for the read-only market health check");
+  const auditProfile = resolveV16AuditProfile(process.env);
   const rpcSignals = new RpcOperationSignalScope();
   const connection = new Connection(rpcUrl, {
     commitment: "confirmed",
@@ -143,25 +128,13 @@ async function main(): Promise<void> {
             lpData: Buffer.from(lpInfo.data),
             marketData,
             observedClusterSlot: BigInt(accounts.context.slot),
-          }), parseUsdcFloor(process.env.LP_MIN_CAPITAL_USDC), {
-            expectedDomainInsurance: parseUsdcAmount(
-              process.env.EXPECTED_DOMAIN_INSURANCE_USDC,
-              100_000,
-              "EXPECTED_DOMAIN_INSURANCE_USDC",
-            ),
-            maxClockLagSlots: parseSlotLimit(process.env.MARKET_MAX_CLOCK_LAG_SLOTS, 300n),
-            minimumLpRiskEquity: parseUsdcAmount(
-              process.env.LP_MIN_RISK_EQUITY_USDC,
-              100_000,
-              "LP_MIN_RISK_EQUITY_USDC",
-            ),
-            requireAuthorityParity: parseStrictBoolean(process.env.REQUIRE_AUTHORITY_PARITY, true),
-          });
+          }), parseUsdcFloor(process.env.LP_MIN_CAPITAL_USDC), auditProfile.options);
         },
         sleep: (ms) => abortableSleep(ms, signal),
       });
     }),
   });
+  console.log(`AUDIT PROFILE ${auditProfile.name.toUpperCase()}`);
   console.log(formatV16MarketHealth(coherence.assessment));
   console.log(formatV16HealthCoherence(coherence));
   if (coherence.kind === "failed"

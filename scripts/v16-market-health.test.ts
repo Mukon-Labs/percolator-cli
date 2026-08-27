@@ -337,6 +337,40 @@ test("recovered target is healthy only with certified risk equity and exact insu
   assert.equal(health.domainInsurance, 100_000_000_000n);
 });
 
+test("operational floors allow bounded credit haircuts without hiding financial failures", () => {
+  const market = marketFixture();
+  writeU128(market, ENGINE_BASE + 579 + 160, CREDIT_RATE_ONE / 2n);
+  const health = assessV16MarketHealth(snapshotFromBuffers(market), 0n, {
+    maxClockLagSlots: 300n,
+    minimumDomainInsurance: 9_000_000_000n,
+    minimumLpRiskEquity: 40_000_000_000n,
+    requireAuthorityParity: true,
+    requireFullSourceCredit: false,
+  });
+  assert.equal(health.level, "warning");
+  assert.ok(health.warningReasons.includes("insurance domain 0 source credit rate is not 1"));
+  assert.equal(health.criticalReasons.length, 0);
+
+  const underinsured = assessV16MarketHealth(snapshot(), 0n, {
+    minimumDomainInsurance: 11_000_000_000n,
+    requireFullSourceCredit: false,
+  });
+  assert.equal(underinsured.level, "critical");
+  assert.ok(underinsured.criticalReasons.includes(
+    "domain insurance is below the configured operational floor",
+  ));
+});
+
+test("a source credit rate above one is invalid in every audit profile", () => {
+  const market = marketFixture();
+  writeU128(market, ENGINE_BASE + 579 + 160, CREDIT_RATE_ONE + 1n);
+  const health = assessV16MarketHealth(snapshotFromBuffers(market), 0n, {
+    requireFullSourceCredit: false,
+  });
+  assert.equal(health.level, "invalid");
+  assert.ok(health.invalidReasons.includes("insurance domain 0 source credit rate exceeds 1"));
+});
+
 test("identity, boolean, and operating-floor parsing fail closed", () => {
   const wrongLp = lpFixture();
   wrongLp.fill(9, 48, 80);
