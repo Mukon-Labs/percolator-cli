@@ -13,7 +13,8 @@
     "typecheck:tests": "tsc -p tsconfig.tests.json",
     "smoke": "tsx scripts/smoke-v16-bounty5.ts",
     "test": "tsx tests/v16/devnet-smoke.ts",
-    "test:offline": "tsx scripts/verify-manifest.ts"
+    "test:offline": "tsx scripts/verify-manifest.ts",
+    "test:mukon-compat": "tsx scripts/mukon-deployed-v16.test.ts"
   },
   "dependencies": {
     "@pythnetwork/hermes-client": "^2.1.0",
