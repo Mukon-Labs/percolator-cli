@@ -31,12 +31,15 @@ import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import bs58 from "bs58";
 import {
   abortableSleep,
+  availableRecoveryNeedsCatchUp,
   classifyKeeperError,
   confirmConnectionTransaction,
   confirmedTransactionError,
   crankBufferSeedForMarket,
   ensureUsableCrankBuffer,
+  fetchAvailableHermesFeeds,
   formatUnhandledRejection,
+  HermesFeedEntitlementQuarantine,
   isUsableLeglessCrankBuffer,
   KeeperLifecycle,
   KeeperFailure,
@@ -48,7 +51,6 @@ import {
   PushWatchdog,
   RpcCircuitBreaker,
   RpcOperationSignalScope,
-  requireConfiguredHermesFeeds,
   requireKeeperConfiguration,
   runDeadlineBoundOperation,
   runBoundedSelfHeal,
@@ -107,6 +109,9 @@ const ASSETS: Array<{ index: number; symbol: string; feedId: string }> = [
   { index: 2, symbol: "ETH", feedId: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace" },
   { index: 3, symbol: "ZEC", feedId: "be9b59d178f0d6a97ab4c343bff2aa69caa1eaae3e9048a65788c529b125bb24" },
 ];
+// ZEC remains visible as Coming Soon but is excluded until its provider feed
+// is explicitly entitled. It must not block the three available demo markets.
+const KEEPER_ASSETS = ASSETS.filter((asset) => asset.symbol !== "ZEC");
 const PUSH_INTERVAL_MS = 5000;
 const TICK_DEADLINE_MS = 20_000;   // hard cap on one tick, releases the guard
 const WATCHDOG_MS = 150_000;       // no successful push for this long -> exit(1)
@@ -480,7 +485,10 @@ async function fetchMarketRecoveryStatus(signal: AbortSignal): Promise<V16Recove
   );
 }
 
-async function marketNeedsCatchUp(parentSignal: AbortSignal): Promise<boolean> {
+async function marketNeedsCatchUp(
+  parentSignal: AbortSignal,
+  availableAssetIndexes: readonly number[],
+): Promise<boolean> {
   // A healthy status suppresses recovery writes, but never permanently
   // suppresses this bounded probe. Passive asset clocks can cross the limit
   // without first producing Custom-21.
@@ -494,12 +502,18 @@ async function marketNeedsCatchUp(parentSignal: AbortSignal): Promise<boolean> {
       timeoutMs: 5_000,
       work: fetchMarketRecoveryStatus,
     });
-    knownMarketNeedsCatchUp = status.needsCatchUp;
+    const available = new Set(availableAssetIndexes);
+    const availableLagging = status.laggingAssetIndexes.filter((index) => available.has(index));
+    knownMarketNeedsCatchUp = availableRecoveryNeedsCatchUp(status, availableAssetIndexes);
     nextMarketStatusCheckMs = now + MARKET_STATUS_CHECK_MS;
     if (!status.lossStaleActive && status.laggingAssetIndexes.length > 0) {
       console.log(
         `  asset-clock recovery active: assets ${status.laggingAssetIndexes.join(",")}, max lag ${status.maxActiveAssetClockLag}`,
       );
+      const blocked = status.laggingAssetIndexes.filter((index) => !available.has(index));
+      if (blocked.length > 0 && availableLagging.length === 0) {
+        console.error(`  asset-clock recovery waiting for unavailable oracle asset indexes ${blocked.join(",")}`);
+      }
     }
   } catch (error) {
     if (parentSignal.aborted) throw error;
@@ -570,7 +584,8 @@ async function reportLpHealth(
 console.log("Oracle Keeper (v16, hardened v2) started");
 console.log(`  Program: ${PROGRAM_ID.toBase58()}`);
 console.log(`  Market:  ${MARKET.toBase58()}`);
-console.log(`  Assets:  ${ASSETS.map((a) => `${a.index}=${a.symbol}`).join(", ")}`);
+console.log(`  Active feeds: ${KEEPER_ASSETS.map((a) => `${a.index}=${a.symbol}`).join(", ")}`);
+console.log("  Unavailable:  3=ZEC (Coming Soon; no provider entitlement)");
 console.log(`  Auth:    ${payer.publicKey.toBase58()}`);
 console.log(`  Mode:    ${KEEPER_MODE}`);
 console.log(`  Recovery clock bound: ${MARKET_MAX_CLOCK_LAG_SLOTS} slots`);
@@ -580,6 +595,7 @@ let consecutiveErrors = 0;
 let healing = false;
 const rpcCircuit = new RpcCircuitBreaker(systemClock);
 const assetQuarantine = new AssetQuarantine(Date.now);
+const feedEntitlementQuarantine = new HermesFeedEntitlementQuarantine(Date.now);
 const tickRunner = new SingleTickRunner(systemClock, TICK_DEADLINE_MS);
 const bootRunner = new SingleTickRunner(systemClock, TICK_DEADLINE_MS);
 const watchdog = new PushWatchdog(Date.now());
@@ -595,6 +611,7 @@ let knownMarketNeedsCatchUp = false;
 let nextMarketStatusCheckMs = 0;
 let nextLpHealthCheckMs = 0;
 let nextLpFailureHealthCheckMs = 0;
+let lastUnavailableFeedSet = "";
 
 interface AssetPushPlan {
   index: number;
@@ -697,36 +714,56 @@ process.once("SIGTERM", stopKeeper);
 async function tickInner(signal: AbortSignal) {
   // Keep the Hermes operation signal alive through headers, body parsing, and
   // configured-feed validation; a headers-only response must not outlive tick.
-  const feeds = await runDeadlineBoundOperation({
+  const feedResult = await runDeadlineBoundOperation({
     parentSignal: signal,
     timeoutMs: 5000,
-    work: async (hermesSignal) => {
-      const url = pythHermesUrl(
-        pythHermes,
-        "/v2/updates/price/latest",
-        ASSETS.map((asset) => ["ids[]", asset.feedId] as const),
-      );
-      const resp = await fetch(url, {
-        headers: pythHermesHeaders(pythHermes),
-        signal: hermesSignal,
-      });
-      if (!resp.ok) {
-        throw new KeeperFailure(
-          resp.status === 429 ? "rate_limit" : "transport",
-          `Pyth HTTP ${resp.status}`,
-          retryAfterMs(resp.headers, Date.now()),
+    work: (hermesSignal) => fetchAvailableHermesFeeds({
+      feeds: KEEPER_ASSETS,
+      quarantine: feedEntitlementQuarantine,
+      fetchBatch: async (requested) => {
+        const url = pythHermesUrl(
+          pythHermes,
+          "/v2/updates/price/latest",
+          requested.map((asset) => ["ids[]", asset.feedId] as const),
         );
-      }
-      const data = await resp.json();
-      const parsed: Array<{ id: string; price: { price: string; expo: number } }> = data.parsed ?? [];
-      return requireConfiguredHermesFeeds(ASSETS.map((asset) => asset.feedId), parsed);
-    },
+        const resp = await fetch(url, {
+          headers: pythHermesHeaders(pythHermes),
+          signal: hermesSignal,
+        });
+        if (resp.status === 403) return { kind: "denied" as const };
+        if (!resp.ok) {
+          throw new KeeperFailure(
+            resp.status === 401
+              ? "provider_denied"
+              : resp.status === 429 ? "rate_limit" : "transport",
+            `Pyth HTTP ${resp.status}`,
+            retryAfterMs(resp.headers, Date.now()),
+          );
+        }
+        const data: unknown = await resp.json();
+        const parsed = data && typeof data === "object" && Array.isArray((data as { parsed?: unknown }).parsed)
+          ? (data as { parsed: Array<{ id: string; price: { price: string; expo: number } }> }).parsed
+          : [];
+        return { items: parsed, kind: "ok" as const };
+      },
+    }),
   });
+
+  const unavailableKey = feedResult.unavailableIndexes.join(",");
+  if (unavailableKey !== lastUnavailableFeedSet) {
+    lastUnavailableFeedSet = unavailableKey;
+    if (feedResult.unavailableIndexes.length > 0) {
+      console.error(`  Pyth entitlement unavailable for asset indexes ${unavailableKey}; healthy feeds remain active`);
+    } else {
+      console.log("  complete configured Pyth feed set restored");
+    }
+  }
 
   const nowSlot = BigInt(await conn.getSlot("confirmed"));
   const plans: AssetPushPlan[] = [];
-  for (const a of ASSETS) {
-    const item = feeds.get(a.feedId)!;
+  for (const a of KEEPER_ASSETS) {
+    const item = feedResult.feeds.get(a.feedId);
+    if (!item) continue;
     const price = Number(item.price.price) * Math.pow(10, item.price.expo);
     plans.push({
       index: a.index,
@@ -781,7 +818,7 @@ async function tickInner(signal: AbortSignal) {
     // A normal LP crank can succeed without catching every asset clock up
     // after a keeper outage. Continue bounded legless-buffer recovery until
     // both the lock and every configured active-asset clock are healthy.
-    if (await marketNeedsCatchUp(signal)) {
+    if (await marketNeedsCatchUp(signal, pushed)) {
       if (!healing) {
         healing = true;
         try {

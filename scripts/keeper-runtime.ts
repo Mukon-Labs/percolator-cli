@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-export type KeeperFailureKind = "cancelled" | "expired" | "onchain" | "pending" | "rate_limit" | "timeout" | "transport" | "unknown";
+export type KeeperFailureKind = "cancelled" | "expired" | "onchain" | "pending" | "provider_denied" | "rate_limit" | "timeout" | "transport" | "unknown";
 
 export class KeeperFailure extends Error {
   constructor(
@@ -555,9 +555,17 @@ export class RpcCircuitBreaker {
   }
 
   recordFailure(failure: KeeperFailure): number | null {
-    if (failure.kind !== "expired" && failure.kind !== "rate_limit" && failure.kind !== "transport" && failure.kind !== "timeout") return null;
+    if (failure.kind !== "expired"
+      && failure.kind !== "provider_denied"
+      && failure.kind !== "rate_limit"
+      && failure.kind !== "transport"
+      && failure.kind !== "timeout") return null;
     this.state.failures += 1;
-    const base = failure.kind === "rate_limit" ? this.rateLimitBaseMs : this.transportBaseMs;
+    // A deterministic provider denial needs bounded probing, not a watchdog
+    // restart storm while an operator repairs the credential or entitlement.
+    const base = failure.kind === "rate_limit" || failure.kind === "provider_denied"
+      ? this.rateLimitBaseMs
+      : this.transportBaseMs;
     const exponential = Math.min(base * 2 ** Math.min(this.state.failures - 1, 5), this.maxBackoffMs);
     // Jitter only the locally chosen exponential component. Retry-After is
     // honored up to maxBackoffMs; beyond that we deliberately probe at the
@@ -690,6 +698,119 @@ export function requireConfiguredHermesFeeds<T extends { id: string }>(
     throw new KeeperFailure("transport", "Pyth response missing configured feed");
   }
   return byId;
+}
+
+export interface HermesFeedDescriptor {
+  feedId: string;
+  index: number;
+}
+
+export interface HermesFeedDenialSnapshot {
+  failures: number;
+  feedId: string;
+  index: number;
+  openUntilMs: number;
+}
+
+/** Bounded, non-secret cache for deterministic per-feed entitlement failures. */
+export class HermesFeedEntitlementQuarantine {
+  private readonly states = new Map<string, HermesFeedDenialSnapshot>();
+
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly baseBackoffMs = 60_000,
+    private readonly maxBackoffMs = 15 * 60_000,
+  ) {}
+
+  eligible<T extends HermesFeedDescriptor>(feeds: readonly T[]): T[] {
+    return feeds.filter((feed) => {
+      const state = this.states.get(feed.feedId);
+      return state === undefined || this.now() >= state.openUntilMs;
+    });
+  }
+
+  recordDenied(feed: HermesFeedDescriptor): HermesFeedDenialSnapshot {
+    const previous = this.states.get(feed.feedId);
+    const failures = (previous?.failures ?? 0) + 1;
+    const delay = Math.min(this.maxBackoffMs, this.baseBackoffMs * 2 ** Math.min(failures - 1, 8));
+    const next = { failures, feedId: feed.feedId, index: feed.index, openUntilMs: this.now() + delay };
+    this.states.set(feed.feedId, next);
+    return { ...next };
+  }
+
+  recordSuccess(feed: HermesFeedDescriptor): void {
+    this.states.delete(feed.feedId);
+  }
+
+  snapshot(): HermesFeedDenialSnapshot[] {
+    return [...this.states.values()]
+      .map((state) => ({ ...state }))
+      .sort((left, right) => left.index - right.index);
+  }
+}
+
+export type HermesBatchFetchResult<T extends { id: string }> =
+  | { kind: "denied" }
+  | { items: readonly T[]; kind: "ok" };
+
+/** Keep one normal batch; only an entitlement denial triggers bounded probes. */
+export async function fetchAvailableHermesFeeds<
+  TFeed extends HermesFeedDescriptor,
+  TItem extends { id: string },
+>(input: {
+  feeds: readonly TFeed[];
+  fetchBatch(feeds: readonly TFeed[]): Promise<HermesBatchFetchResult<TItem>>;
+  quarantine: HermesFeedEntitlementQuarantine;
+}): Promise<{ feeds: Map<string, TItem>; unavailableIndexes: number[] }> {
+  const eligible = input.quarantine.eligible(input.feeds);
+  const alreadyDenied = input.quarantine.snapshot()
+    .filter((state) => !eligible.some((feed) => feed.feedId === state.feedId))
+    .map((state) => state.index);
+  if (eligible.length === 0) {
+    throw new KeeperFailure("provider_denied", "Pyth denied every configured feed");
+  }
+
+  const batch = await input.fetchBatch(eligible);
+  if (batch.kind === "ok") {
+    const feeds = requireConfiguredHermesFeeds(eligible.map((feed) => feed.feedId), batch.items);
+    for (const feed of eligible) input.quarantine.recordSuccess(feed);
+    return { feeds, unavailableIndexes: alreadyDenied };
+  }
+
+  const probes = await Promise.allSettled(eligible.map(async (feed) => ({
+    feed,
+    result: await input.fetchBatch([feed]),
+  })));
+  const available = new Map<string, TItem>();
+  const unavailableIndexes = [...alreadyDenied];
+  let firstTransientFailure: unknown;
+  for (const probe of probes) {
+    if (probe.status === "rejected") {
+      firstTransientFailure ??= probe.reason;
+      continue;
+    }
+    const { feed, result } = probe.value;
+    if (result.kind === "denied") {
+      input.quarantine.recordDenied(feed);
+      unavailableIndexes.push(feed.index);
+      continue;
+    }
+    try {
+      const parsed = requireConfiguredHermesFeeds([feed.feedId], result.items);
+      available.set(feed.feedId, parsed.get(feed.feedId)!);
+      input.quarantine.recordSuccess(feed);
+    } catch (error) {
+      firstTransientFailure ??= error;
+    }
+  }
+  if (available.size === 0) {
+    if (firstTransientFailure) throw firstTransientFailure;
+    throw new KeeperFailure("provider_denied", "Pyth denied every configured feed");
+  }
+  return {
+    feeds: available,
+    unavailableIndexes: [...new Set(unavailableIndexes)].sort((left, right) => left - right),
+  };
 }
 
 const V16_MAGIC = 0x5045_5243_5631_3600n;
@@ -945,6 +1066,23 @@ export interface V16RecoveryStatus {
   marketCurrentSlot: bigint;
   maxActiveAssetClockLag: bigint;
   needsCatchUp: boolean;
+}
+
+/**
+ * A legless self-heal can only advance assets included in the current oracle
+ * set. Do not burn transactions cranking healthy assets when every lagging
+ * clock belongs to a deliberately unavailable market.
+ */
+export function availableRecoveryNeedsCatchUp(
+  status: V16RecoveryStatus,
+  availableAssetIndexes: readonly number[],
+): boolean {
+  const available = new Set(availableAssetIndexes);
+  if (status.laggingAssetIndexes.some((index) => available.has(index))) return true;
+  // A lock without an identified lagging clock still warrants one bounded
+  // available-set heal attempt. A lock attributable only to unavailable
+  // clocks cannot be progressed by unrelated writes.
+  return status.lossStaleActive && status.laggingAssetIndexes.length === 0;
 }
 
 export function parseRecoveryClockLagSlots(value: string | undefined, fallback = 300n): bigint {

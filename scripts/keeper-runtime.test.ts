@@ -16,14 +16,17 @@ import {
 } from "./keeper-shadow.ts";
 import {
   abortableSleep,
+  availableRecoveryNeedsCatchUp,
   classifyKeeperError,
   confirmConnectionTransaction,
   confirmedTransactionError,
   confirmationResultFromError,
   crankBufferSeedForMarket,
   ensureUsableCrankBuffer,
+  fetchAvailableHermesFeeds,
   formatConfirmationFallbackError,
   formatUnhandledRejection,
+  HermesFeedEntitlementQuarantine,
   isUsableLeglessCrankBuffer,
   isCustomProgramError,
   KeeperFailure,
@@ -882,6 +885,70 @@ test("partial Hermes data fails the whole configured feed set", () => {
   assert.equal(requireConfiguredHermesFeeds(["sol", "btc"], [{ id: "sol" }, { id: "btc" }]).size, 2);
 });
 
+test("one denied Hermes feed is quarantined without blocking healthy feeds", async () => {
+  const clock = fakeClock(1_000);
+  const quarantine = new HermesFeedEntitlementQuarantine(clock.now, 100, 400);
+  const feeds = [
+    { feedId: "sol", index: 0 },
+    { feedId: "btc", index: 1 },
+    { feedId: "zec", index: 3 },
+  ];
+  const calls: string[][] = [];
+  const first = await fetchAvailableHermesFeeds({
+    feeds,
+    quarantine,
+    fetchBatch: async (requested) => {
+      calls.push(requested.map((feed) => feed.feedId));
+      if (requested.some((feed) => feed.feedId === "zec")) return { kind: "denied" as const };
+      return { kind: "ok" as const, items: requested.map((feed) => ({ id: feed.feedId })) };
+    },
+  });
+  assert.deepEqual(calls, [["sol", "btc", "zec"], ["sol"], ["btc"], ["zec"]]);
+  assert.deepEqual([...first.feeds.keys()], ["sol", "btc"]);
+  assert.deepEqual(first.unavailableIndexes, [3]);
+
+  calls.length = 0;
+  const second = await fetchAvailableHermesFeeds({
+    feeds,
+    quarantine,
+    fetchBatch: async (requested) => {
+      calls.push(requested.map((feed) => feed.feedId));
+      return { kind: "ok" as const, items: requested.map((feed) => ({ id: feed.feedId })) };
+    },
+  });
+  assert.deepEqual(calls, [["sol", "btc"]]);
+  assert.deepEqual([...second.feeds.keys()], ["sol", "btc"]);
+  assert.deepEqual(second.unavailableIndexes, [3]);
+
+  clock.advance(100);
+  const restored = await fetchAvailableHermesFeeds({
+    feeds,
+    quarantine,
+    fetchBatch: async (requested) => ({
+      kind: "ok" as const,
+      items: requested.map((feed) => ({ id: feed.feedId })),
+    }),
+  });
+  assert.deepEqual([...restored.feeds.keys()], ["sol", "btc", "zec"]);
+  assert.deepEqual(restored.unavailableIndexes, []);
+});
+
+test("an all-feed entitlement denial opens the provider circuit", async () => {
+  const feeds = [{ feedId: "sol", index: 0 }, { feedId: "zec", index: 3 }];
+  await assert.rejects(
+    fetchAvailableHermesFeeds({
+      feeds,
+      quarantine: new HermesFeedEntitlementQuarantine(() => 1_000),
+      fetchBatch: async () => ({ kind: "denied" as const }),
+    }),
+    (error: unknown) => error instanceof KeeperFailure && error.kind === "provider_denied",
+  );
+  const clock = fakeClock(1_000, 0);
+  const breaker = new RpcCircuitBreaker(clock, 30_000, 5_000, 15 * 60_000);
+  assert.equal(breaker.recordFailure(new KeeperFailure("provider_denied", "Pyth access rejected")), 30_000);
+  assert.deepEqual(breaker.snapshot(), { failures: 1, openUntilMs: 31_000 });
+});
+
 function usableBufferData(): { data: Uint8Array; market: Uint8Array; portfolio: Uint8Array } {
   const data = new Uint8Array(9411);
   const view = new DataView(data.buffer);
@@ -1147,6 +1214,20 @@ test("v16 recovery remains active after loss-stale clears until active asset clo
     maxActiveAssetClockLag: 127_880n,
     needsCatchUp: true,
   });
+});
+
+test("recovery writes ignore lag belonging only to an unavailable Coming Soon asset", () => {
+  const status = {
+    laggingAssetIndexes: [3],
+    lossStaleActive: false,
+    marketCurrentSlot: 200_000n,
+    maxActiveAssetClockLag: 10_000n,
+    needsCatchUp: true,
+  };
+  assert.equal(availableRecoveryNeedsCatchUp(status, [0, 1, 2]), false);
+  assert.equal(availableRecoveryNeedsCatchUp({ ...status, laggingAssetIndexes: [1, 3] }, [0, 1, 2]), true);
+  assert.equal(availableRecoveryNeedsCatchUp({ ...status, laggingAssetIndexes: [], lossStaleActive: true }, [0, 1, 2]), true);
+  assert.equal(availableRecoveryNeedsCatchUp({ ...status, lossStaleActive: true }, [0, 1, 2]), false);
 });
 
 test("v16 recovery stops only when both the loss-stale lock and active clock lag are bounded", () => {
