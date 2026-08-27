@@ -70,7 +70,10 @@ const ADL_ONE = 1_000_000_000_000_000n;
 const CREDIT_RATE_ONE = 1_000_000_000_000n;
 const BACKING_FRESH = 1;
 const LIFECYCLE_UNINITIALIZED = 0;
+const LIFECYCLE_ACTIVE = 2;
+const LIFECYCLE_DRAIN_ONLY = 3;
 const LIFECYCLE_RETIRED = 4;
+const LIFECYCLE_RECOVERY = 5;
 
 const PORTFOLIO_STATE_OFF = HEADER_LEN;
 const PORTFOLIO_MIN_LEN = 9411;
@@ -124,6 +127,16 @@ function strictBool(data: Buffer, offset: number, label: string): boolean {
   if (value === 0) return false;
   if (value === 1) return true;
   return fail(`${label} has an invalid boolean encoding`);
+}
+
+function lifecycleRequiresLiveClock(lifecycle: number): boolean {
+  return lifecycle === LIFECYCLE_ACTIVE || lifecycle === LIFECYCLE_DRAIN_ONLY;
+}
+
+function assertKnownLifecycle(lifecycle: number, asset: number): void {
+  if (lifecycle < LIFECYCLE_UNINITIALIZED || lifecycle > LIFECYCLE_RECOVERY) {
+    fail(`asset ${asset} has an invalid lifecycle encoding`);
+  }
 }
 
 export interface V16SideHealthSnapshot {
@@ -296,6 +309,7 @@ export function readV16MarketHealthSnapshot(input: {
     const base = assetBase(asset);
     const engineBase = engineAssetBase(asset);
     const lifecycle = marketData.readUInt8(engineBase + ASSET_LIFECYCLE_OFF);
+    assertKnownLifecycle(lifecycle, asset);
     if (lifecycle === LIFECYCLE_UNINITIALIZED || lifecycle === LIFECYCLE_RETIRED) continue;
     const slotLast = marketData.readBigUInt64LE(engineBase + ASSET_SLOT_LAST_OFF);
     const oracleSlot = marketData.readBigUInt64LE(
@@ -430,7 +444,8 @@ export function assessV16MarketHealth(
     invalidReasons.push("market clocks are ahead of their observed parent clock");
   }
   for (const asset of snapshot.assets) {
-    if (asset.sideStateLag < 0n || asset.oracleLag < 0n) {
+    if (lifecycleRequiresLiveClock(asset.lifecycle)
+      && (asset.sideStateLag < 0n || asset.oracleLag < 0n)) {
       invalidReasons.push(`asset ${asset.asset} clocks are ahead of the market clock`);
     }
   }
@@ -465,7 +480,7 @@ export function assessV16MarketHealth(
     if (options.requireAuthorityParity && !asset.authorityParity) {
       criticalReasons.push(`asset ${asset.asset} delegated authorities do not match market authority`);
     }
-    if (options.maxClockLagSlots !== undefined) {
+    if (options.maxClockLagSlots !== undefined && lifecycleRequiresLiveClock(asset.lifecycle)) {
       if (asset.sideStateLag > options.maxClockLagSlots) {
         criticalReasons.push(`asset ${asset.asset} state clock exceeds the configured lag limit`);
       }

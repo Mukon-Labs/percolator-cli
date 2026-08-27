@@ -259,6 +259,60 @@ test("clock lag and stale LP certificate epochs are critical", () => {
   assert.ok(staleCert.reasons.some((reason) => reason.includes("current health certificate")));
 });
 
+test("only Active and DrainOnly assets require live clock bounds", () => {
+  for (const lifecycle of [2, 3]) {
+    const market = marketFixture();
+    market.writeUInt8(lifecycle, ENGINE_BASE + 16);
+    market.writeBigUInt64LE(1n, ENGINE_BASE + 41);
+    market.writeBigUInt64LE(1n, 168);
+    const health = assessV16MarketHealth(snapshotFromBuffers(market), 0n, {
+      maxClockLagSlots: 300n,
+    });
+    assert.equal(health.level, "critical");
+    assert.ok(health.criticalReasons.includes("asset 0 state clock exceeds the configured lag limit"));
+    assert.ok(health.criticalReasons.includes("asset 0 oracle clock exceeds the configured lag limit"));
+  }
+
+  for (const lifecycle of [1, 5]) {
+    const market = marketFixture();
+    market.writeUInt8(lifecycle, ENGINE_BASE + 16);
+    market.writeBigUInt64LE(1n, ENGINE_BASE + 41);
+    market.writeBigUInt64LE(1n, 168);
+    const health = assessV16MarketHealth(snapshotFromBuffers(market), 0n, {
+      maxClockLagSlots: 300n,
+    });
+    assert.equal(health.level, "healthy");
+    assert.equal(health.assets[0]?.lifecycle, lifecycle);
+    assert.equal(health.assets[0]?.sideStateLag, 999n);
+    assert.equal(health.assets[0]?.oracleLag, 999n);
+  }
+});
+
+test("Recovery assets retain financial, residue, backing, and authority checks", () => {
+  const market = marketFixture();
+  market.writeUInt8(5, ENGINE_BASE + 16);
+  market.writeBigUInt64LE(1n, ENGINE_BASE + 41);
+  market.writeBigUInt64LE(1n, 168);
+  writeU128(market, ENGINE_BASE + 353, 1n);
+  market.writeBigUInt64LE(1n, ENGINE_BASE + 305);
+  market.writeUInt8(0, ENGINE_BASE + 947 + 96);
+  const health = assessV16MarketHealth(snapshotFromBuffers(market), 0n, {
+    maxClockLagSlots: 300n,
+    requireAuthorityParity: true,
+  });
+  assert.equal(health.level, "critical");
+  assert.ok(health.criticalReasons.includes("asset 0 long has zero-OI residue"));
+  assert.ok(health.criticalReasons.includes("insurance domain 0 backing is not fresh"));
+  assert.ok(!health.criticalReasons.some((reason) => reason.includes("asset 0 state clock")));
+  assert.ok(!health.criticalReasons.some((reason) => reason.includes("asset 0 oracle clock")));
+});
+
+test("unknown lifecycle encodings fail closed", () => {
+  const market = marketFixture();
+  market.writeUInt8(6, ENGINE_BASE + 16);
+  assert.throws(() => snapshotFromBuffers(market), /invalid lifecycle encoding/);
+});
+
 test("recovered target is healthy only with certified risk equity and exact insurance", () => {
   const health = assessV16MarketHealth(snapshot({
     market: {

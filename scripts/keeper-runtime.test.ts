@@ -1270,6 +1270,22 @@ test("v16 recovery ignores configured/retired slots but includes drain-only asse
   assert.equal(status.needsCatchUp, true);
 });
 
+test("v16 recovery ignores Recovery clocks without hiding Active or DrainOnly debt", () => {
+  const currentSlot = 200_000n;
+  const { data, market } = recoveryMarketFixture({
+    currentSlot,
+    lifecycles: [2, 3, 5, 5],
+    slotLast: [currentSlot - 301n, currentSlot - 450n, 0n, currentSlot + 1n],
+  });
+  assert.deepEqual(readV16RecoveryStatus(data, market, 300n), {
+    laggingAssetIndexes: [0, 1],
+    lossStaleActive: false,
+    marketCurrentSlot: currentSlot,
+    maxActiveAssetClockLag: 450n,
+    needsCatchUp: true,
+  });
+});
+
 test("v16 recovery parsing fails closed on identity, layout, lifecycle, clock, and config errors", () => {
   const fixture = recoveryMarketFixture();
   assert.throws(
@@ -1290,7 +1306,7 @@ test("v16 recovery parsing fails closed on identity, layout, lifecycle, clock, a
   assert.throws(() => readV16RecoveryStatus(invalidBool, fixture.market, 300n), /loss-stale flag/);
 
   const invalidLifecycle = Buffer.from(fixture.data);
-  invalidLifecycle.writeUInt8(5, V16_TEST_MARKET_MIN_LEN + V16_TEST_ENGINE_ASSET_OFFSET + 16);
+  invalidLifecycle.writeUInt8(6, V16_TEST_MARKET_MIN_LEN + V16_TEST_ENGINE_ASSET_OFFSET + 16);
   assert.throws(() => readV16RecoveryStatus(invalidLifecycle, fixture.market, 300n), /lifecycle/);
 
   const futureClock = Buffer.from(fixture.data);
