@@ -1,6 +1,6 @@
 # Oracle Keeper — Hosting Guide (Fly.io)
 
-The keeper pushes live Pyth prices to the SOL / BTC / ETH / ZEC v16 asset slots on devnet.
+The keeper pushes validated Pyth prices to the SOL / BTC / ETH v16 asset slots on devnet.
 If it stops, those markets freeze (no fresh oracle → trades revert / show stale PnL).
 This runs it 24/7 on Fly.io — the same platform as mukon-messengr.
 
@@ -14,18 +14,31 @@ rotation, and rate-limit incidents attributable.
   (`https://devnet.helius-rpc.com/?api-key=...`)
 - **QuickNode**: https://quicknode.com → create a Solana devnet endpoint
 
-## 2. Prepare the server-only credentials
+## 2. Select the price source and prepare server-only credentials
 
-The keeper reads Pyth through authenticated Hermes. Create the API credential
-in Pyth Terminal and enter it only as the `PYTH_API_KEY` runtime secret. The
-default endpoint is the authenticated Core service at
+Devnet defaults to `PYTH_PRICE_SOURCE=solana-push`. It reads Pyth's sponsored
+shard-0 SOL/BTC/ETH accounts through the existing keeper RPC, so no Pyth API
+credential is required. During the Pyth program migration it derives both the
+upgraded and legacy deterministic accounts, verifies each account against its
+exact receiver owner and feed ID, requires Full verification, and uses the
+freshest valid sample. A sample older than 300 seconds or with confidence wider
+than 1% is unavailable and is never restamped as fresh. ZEC remains Recovery /
+Coming Soon and is not read or pushed.
+
+This sponsored-account mode is the temporary devnet/testnet fallback. Its
+heartbeat is not suitable as the eventual production perp oracle SLA. Keep
+production trading disabled until a reviewed production data-source package is
+selected.
+
+Authenticated Hermes remains available by explicitly setting
+`PYTH_PRICE_SOURCE=hermes`. Create its API credential in Pyth Terminal and enter
+it only as the `PYTH_API_KEY` runtime secret. The default endpoint is
 `https://hermes.pyth.network`; an alternative credential-free HTTPS provider
-URL may be supplied with the non-secret `PYTH_HERMES_URL` setting. Do not select
-the upgraded endpoint until the configured credential passes a redacted
-entitlement preflight.
+URL may be supplied with the non-secret `PYTH_HERMES_URL` setting.
 
-Never expose `PYTH_API_KEY` through `NEXT_PUBLIC_*`, logs, source, or a command
-that records shell history. Local development uses an ignored `.env` file.
+When Hermes mode is selected, never expose `PYTH_API_KEY` through
+`NEXT_PUBLIC_*`, logs, source, or a command that records shell history. Local
+development uses an ignored `.env` file.
 
 Fly has no local keypair file, so the existing oracle-authority signer is stored
 as the `KEEPER_SECRET_KEY` runtime secret. It is a Solana signer, not a Helius
@@ -56,11 +69,13 @@ fly secrets list -a ninja-oracle-keeper
 ```
 
 After code review and a fresh secret-change authorization, the operator enters
-the three values through Fly's server-side secret manager. Use the dashboard or
-an approved non-echoing/staged input flow; never put literal values in a shell
-command, source, logs or chat. Re-run the names-only `fly secrets list` check
-afterward. This is a mutation, not part of this read-only runbook check. Do not
-use `fly scale count` as singleton verification.
+credential values through Fly's server-side secret manager. Sponsored-account
+mode needs only the existing keeper RPC and oracle-authority signer; Hermes mode
+also needs `PYTH_API_KEY`. Use the dashboard or an approved non-echoing/staged
+input flow; never put literal values in a shell command, source, logs or chat.
+Re-run the names-only `fly secrets list` check afterward. This is a mutation,
+not part of this read-only runbook check. Do not use `fly scale count` as
+singleton verification.
 
 Normal code promotion uses only the protected GitHub workflow documented in
 `FLY_RELEASE.md`. It requires the singleton to be **started**, builds and pins
@@ -119,13 +134,15 @@ after that the keeper performs a bounded probe rather than sleeping forever.
 
 See `.env.example`. `RPC_URL` must be a dedicated keeper endpoint,
 `KEEPER_SECRET_KEY` must be the existing oracle-authority signer (not LP,
-upgrade, browser, or mint-authority material), and `PYTH_API_KEY` must remain a
-server-only Pyth credential. All three are required. Optional
+upgrade, browser, or mint-authority material). `PYTH_PRICE_SOURCE` defaults to
+`solana-push`; `PYTH_API_KEY` is required only for explicit `hermes` mode and
+must remain server-only. Optional
 `PROGRAM_ID`, `MARKET`, and `LP_PORTFOLIO` overrides must match the intended
-v16 deployment. `PYTH_HERMES_URL` selects an alternative credential-free HTTPS
-Hermes provider without putting credentials in the URL. Do not select the
-upgraded endpoint until the configured credential passes a redacted entitlement
-preflight. `LP_MIN_CAPITAL_USDC` controls the warning floor only and defaults to
+v16 deployment. `PYTH_PUSH_MAX_AGE_SECS` (default and maximum 300) and
+`PYTH_PUSH_MAX_CONFIDENCE_BPS` (default 100) bound sponsored-account samples.
+`PYTH_HERMES_URL` selects an alternative credential-free HTTPS Hermes provider
+without putting credentials in the URL. `LP_MIN_CAPITAL_USDC` controls the
+warning floor only and defaults to
 10,000 test USDC. `MARKET_MAX_CLOCK_LAG_SLOTS` defaults to 300 and gates the
 existing bounded legless-buffer recovery: catch-up continues while loss-stale
 is active or an active/drain-only asset exceeds that limit, then the keeper
@@ -139,8 +156,9 @@ override them in runtime secret stores.
 
 ## Local dev
 
-Local development also requires explicit `RPC_URL`, `KEEPER_SECRET_KEY`, and
-`PYTH_API_KEY`; there is no Solana CLI-identity fallback:
+Local development in sponsored-account mode requires explicit `RPC_URL` and
+`KEEPER_SECRET_KEY`; there is no Solana CLI-identity fallback. Hermes mode also
+requires `PYTH_API_KEY`:
 
 ```bash
 npm run keeper

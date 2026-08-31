@@ -16,7 +16,7 @@
     "keeper": "tsx scripts/oracle-keeper-v16.ts",
     "test:keeper-runtime": "tsx scripts/keeper-runtime.test.ts",
     "test:keeper-release": "node --test scripts/verify-fly-singleton.test.mjs scripts/verify-keeper-release-log.test.mjs scripts/check-keeper-release-workflow.test.mjs",
-    "test:pyth-auth": "tsx scripts/pyth-hermes.test.ts",
+    "test:pyth-auth": "tsx scripts/pyth-hermes.test.ts && tsx scripts/pyth-solana-push.test.ts",
     "test:v16-health": "tsx scripts/v16-market-health.test.ts && tsx scripts/v16-market-coherence.test.ts && tsx scripts/v16-audit-profile.test.ts",
     "check:v16-health": "tsx scripts/check-current-market-health.ts",
     "test:fund-lp": "tsx scripts/fund-current-market-lp.test.ts",

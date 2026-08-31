@@ -88,6 +88,13 @@ import {
   pythHermesUrl,
   requirePythHermesConfiguration,
 } from "./pyth-hermes.ts";
+import {
+  PythPriceUnavailableError,
+  readPythPushPrices,
+  requirePythPriceSourceConfiguration,
+  validatePythPrice,
+  type AvailablePythPushPrices,
+} from "./pyth-solana-push.ts";
 
 const keeperConfiguration = requireKeeperConfiguration(process.env as {
   RPC_URL?: string;
@@ -95,7 +102,10 @@ const keeperConfiguration = requireKeeperConfiguration(process.env as {
 });
 const KEEPER_MODE = keeperModeFromEnv(process.env);
 const RPC_URL = keeperConfiguration.rpcUrl;
-const pythHermes = requirePythHermesConfiguration(process.env);
+const pythPriceSource = requirePythPriceSourceConfiguration(process.env);
+const pythHermes = pythPriceSource.source === "hermes"
+  ? requirePythHermesConfiguration(process.env)
+  : null;
 const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID ?? "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq"
 );
@@ -600,6 +610,7 @@ console.log(`  Active feeds: ${KEEPER_ASSETS.map((a) => `${a.index}=${a.symbol}`
 console.log("  Unavailable:  3=ZEC (Coming Soon; no provider entitlement)");
 console.log(`  Auth:    ${payer.publicKey.toBase58()}`);
 console.log(`  Mode:    ${KEEPER_MODE}`);
+console.log(`  Prices:  ${pythPriceSource.source}${pythPriceSource.source === "solana-push" ? " (sponsored shard 0)" : ""}`);
 console.log(`  Release: ${RELEASE_SOURCE} (${RELEASE_ID})`);
 console.log(`  Recovery clock bound: ${MARKET_MAX_CLOCK_LAG_SLOTS} slots`);
 console.log(`  Push:    every ${PUSH_INTERVAL_MS}ms\n`);
@@ -724,7 +735,8 @@ function stopKeeper(): void {
 process.once("SIGINT", stopKeeper);
 process.once("SIGTERM", stopKeeper);
 
-async function tickInner(signal: AbortSignal) {
+async function readHermesPrices(signal: AbortSignal): Promise<AvailablePythPushPrices> {
+  if (!pythHermes) throw new KeeperFailure("unknown", "Hermes source is not configured");
   // Keep the Hermes operation signal alive through headers, body parsing, and
   // configured-feed validation; a headers-only response must not outlive tick.
   const feedResult = await runDeadlineBoundOperation({
@@ -755,18 +767,71 @@ async function tickInner(signal: AbortSignal) {
         }
         const data: unknown = await resp.json();
         const parsed = data && typeof data === "object" && Array.isArray((data as { parsed?: unknown }).parsed)
-          ? (data as { parsed: Array<{ id: string; price: { price: string; expo: number } }> }).parsed
+          ? (data as { parsed: Array<{
+            id: string;
+            price: { price: string; conf: string; expo: number; publish_time: number };
+          }> }).parsed
           : [];
         return { items: parsed, kind: "ok" as const };
       },
     }),
   });
 
+  const feeds = new Map<string, ReturnType<typeof validatePythPrice>>();
+  const unavailable = new Set(feedResult.unavailableIndexes);
+  const nowSecs = Math.floor(Date.now() / 1000);
+  for (const asset of KEEPER_ASSETS) {
+    const item = feedResult.feeds.get(asset.feedId);
+    if (!item) continue;
+    try {
+      feeds.set(asset.feedId, validatePythPrice({
+        price: item.price.price,
+        confidence: item.price.conf,
+        exponent: item.price.expo,
+        publishTime: item.price.publish_time,
+      }, pythPriceSource, nowSecs));
+    } catch (error) {
+      if (error instanceof PythPriceUnavailableError) {
+        unavailable.add(asset.index);
+        continue;
+      }
+      throw error;
+    }
+  }
+  if (feeds.size === 0) {
+    throw new KeeperFailure("transport", "no fresh Pyth Hermes feeds are available");
+  }
+  return { feeds, unavailableIndexes: [...unavailable].sort((a, b) => a - b) };
+}
+
+async function readOraclePrices(signal: AbortSignal): Promise<AvailablePythPushPrices> {
+  if (signal.aborted) throw new KeeperFailure("cancelled", "oracle price read cancelled");
+  if (pythPriceSource.source === "hermes") return readHermesPrices(signal);
+  try {
+    return await readPythPushPrices({
+      connection: conn,
+      feeds: KEEPER_ASSETS,
+      configuration: pythPriceSource,
+      nowSecs: Math.floor(Date.now() / 1000),
+    });
+  } catch (error) {
+    if (error instanceof PythPriceUnavailableError) {
+      // Treat a complete sponsored-feed outage like a provider transport
+      // failure so the existing circuit suppresses Fly restart amplification.
+      throw new KeeperFailure("transport", error.message);
+    }
+    throw error;
+  }
+}
+
+async function tickInner(signal: AbortSignal) {
+  const feedResult = await readOraclePrices(signal);
+
   const unavailableKey = feedResult.unavailableIndexes.join(",");
   if (unavailableKey !== lastUnavailableFeedSet) {
     lastUnavailableFeedSet = unavailableKey;
     if (feedResult.unavailableIndexes.length > 0) {
-      console.error(`  Pyth entitlement unavailable for asset indexes ${unavailableKey}; healthy feeds remain active`);
+      console.error(`  Pyth source unavailable for asset indexes ${unavailableKey}; healthy feeds remain active`);
     } else {
       console.log("  complete configured Pyth feed set restored");
     }
@@ -777,11 +842,10 @@ async function tickInner(signal: AbortSignal) {
   for (const a of KEEPER_ASSETS) {
     const item = feedResult.feeds.get(a.feedId);
     if (!item) continue;
-    const price = Number(item.price.price) * Math.pow(10, item.price.expo);
     plans.push({
       index: a.index,
-      instruction: ixPushAuthMark(a.index, nowSlot, BigInt(Math.round(price * 1_000_000))),
-      display: `${a.symbol} $${price.toFixed(price >= 1000 ? 0 : 2)}`,
+      instruction: ixPushAuthMark(a.index, nowSlot, item.priceE6),
+      display: `${a.symbol} $${item.displayPrice.toFixed(item.displayPrice >= 1000 ? 0 : 2)}`,
     });
   }
   // Tx 1: PUSHES ONLY — must always land, whatever the crank thinks.
