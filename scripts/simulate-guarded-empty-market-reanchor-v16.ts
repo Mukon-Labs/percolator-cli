@@ -16,7 +16,8 @@ import {
   Connection,
   Keypair,
   PublicKey,
-  Transaction,
+  TransactionMessage,
+  VersionedTransaction,
 } from "@solana/web3.js";
 import {
   AOP,
@@ -256,14 +257,16 @@ async function main(): Promise<void> {
   }
 
   const lifetime = await connection.getLatestBlockhash("confirmed");
-  const transaction = new Transaction({
-    feePayer: authority.publicKey,
+  const message = new TransactionMessage({
+    payerKey: authority.publicKey,
     recentBlockhash: lifetime.blockhash,
-  }).add(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
-    buildReanchorEmptyMarketInstruction({ authority: authority.publicKey }),
-  );
-  transaction.sign(authority);
+    instructions: [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+      buildReanchorEmptyMarketInstruction({ authority: authority.publicKey }),
+    ],
+  }).compileToV0Message();
+  const transaction = new VersionedTransaction(message);
+  transaction.sign([authority]);
   const simulation = await connection.simulateTransaction(transaction, {
     commitment: "confirmed",
     sigVerify: true,
