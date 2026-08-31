@@ -35,7 +35,7 @@ import {
   buildReanchorEmptyMarketInstruction,
 } from "./guarded-empty-market-reanchor-v16.ts";
 
-export const SOLANA_DEVNET_GENESIS_HASH = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+export const SOLANA_DEVNET_GENESIS_HASH = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const UPGRADEABLE_LOADER = new PublicKey("BPFLoaderUpgradeab1e11111111111111111111111");
 const MAX_MARKET_CAPACITY = 64;
 const ASSET_ACTIVE = 2;

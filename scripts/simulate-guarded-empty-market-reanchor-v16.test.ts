@@ -13,6 +13,7 @@ import {
   WC,
 } from "../../../_v16_cli/src/v16/constants.ts";
 import {
+  SOLANA_DEVNET_GENESIS_HASH,
   assertReanchorSimulationEffects,
   safeSimulationError,
 } from "./simulate-guarded-empty-market-reanchor-v16.ts";
@@ -84,4 +85,8 @@ test("simulation errors redact credential-bearing URLs", () => {
     "failed at [rpc-url]",
   );
   assert.equal(AOP.oracle_target_price_e6, 200);
+});
+
+test("simulation is pinned to the complete Solana devnet genesis hash", () => {
+  assert.equal(SOLANA_DEVNET_GENESIS_HASH, "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG");
 });
