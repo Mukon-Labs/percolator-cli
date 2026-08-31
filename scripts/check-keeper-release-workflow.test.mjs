@@ -38,7 +38,10 @@ test("release pins and proves the selected oracle source and restores it on roll
 
 test("release gates promotion and success on operational audits with explicit floors", () => {
   const audits = workflow.match(/scripts\/check-current-market-health\.ts/g) ?? [];
+  const executableAudits = workflow.match(/audit_command="env AUDIT_PROFILE=operational/g) ?? [];
   assert.equal(audits.length, 2, "workflow defines preflight and reusable post-update audits");
+  assert.equal(executableAudits.length, 2, "Fly SSH executes each audit through env");
+  assert.doesNotMatch(workflow, /audit_command="AUDIT_PROFILE=operational/);
   assert.match(workflow, /minimum_lp_risk_equity_usdc/);
   assert.match(workflow, /minimum_domain_insurance_usdc/);
   assert.match(workflow, /AUDIT_PROFILE=operational/);

@@ -190,7 +190,7 @@ jobs:
         run: |
           set -euo pipefail
           health_file="$RUNNER_TEMP/keeper-pre-promotion-health.txt"
-          audit_command="AUDIT_PROFILE=operational LP_MIN_RISK_EQUITY_USDC=${MINIMUM_LP_RISK_EQUITY_USDC} MIN_DOMAIN_INSURANCE_USDC=${MINIMUM_DOMAIN_INSURANCE_USDC} node node_modules/tsx/dist/cli.mjs scripts/check-current-market-health.ts"
+          audit_command="env AUDIT_PROFILE=operational LP_MIN_RISK_EQUITY_USDC=${MINIMUM_LP_RISK_EQUITY_USDC} MIN_DOMAIN_INSURANCE_USDC=${MINIMUM_DOMAIN_INSURANCE_USDC} node node_modules/tsx/dist/cli.mjs scripts/check-current-market-health.ts"
           if ! flyctl ssh console \
               --app "$EXPECTED_APP" \
               --machine "$EXPECTED_MACHINE_ID" \
@@ -248,7 +248,7 @@ jobs:
             local label="$1"
             local slug="${label//[^A-Za-z0-9]/-}"
             local health_file="$RUNNER_TEMP/keeper-${slug}-health.txt"
-            local audit_command="AUDIT_PROFILE=operational LP_MIN_RISK_EQUITY_USDC=${MINIMUM_LP_RISK_EQUITY_USDC} MIN_DOMAIN_INSURANCE_USDC=${MINIMUM_DOMAIN_INSURANCE_USDC} node node_modules/tsx/dist/cli.mjs scripts/check-current-market-health.ts"
+            local audit_command="env AUDIT_PROFILE=operational LP_MIN_RISK_EQUITY_USDC=${MINIMUM_LP_RISK_EQUITY_USDC} MIN_DOMAIN_INSURANCE_USDC=${MINIMUM_DOMAIN_INSURANCE_USDC} node node_modules/tsx/dist/cli.mjs scripts/check-current-market-health.ts"
             if ! flyctl ssh console \
                 --app "$EXPECTED_APP" \
                 --machine "$EXPECTED_MACHINE_ID" \
