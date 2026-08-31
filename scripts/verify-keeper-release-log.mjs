@@ -6,13 +6,16 @@ function fail(message) {
   process.exit(1);
 }
 
-const [expectedMachineId, expectedSourceRevision, expectedReleaseId, notBeforeIso, mode = "strict"] =
+const [expectedMachineId, expectedSourceRevision, expectedReleaseId, notBeforeIso, mode = "strict", expectedOraclePriceSource] =
   process.argv.slice(2);
 
 if (!/^[A-Za-z0-9_-]{6,64}$/.test(expectedMachineId ?? "")) fail("invalid machine ID");
 if (!/^[0-9a-f]{7,64}$/.test(expectedSourceRevision ?? "")) fail("invalid source revision");
 if (!/^[A-Za-z0-9._:-]{1,128}$/.test(expectedReleaseId ?? "")) fail("invalid release ID");
 if (mode !== "strict" && mode !== "legacy-rollback") fail("invalid proof mode");
+if (!["pyth-solana-push", "pyth-hermes", "magicblock-demo"].includes(expectedOraclePriceSource)) {
+  fail("invalid oracle price source");
+}
 
 const notBeforeMs = Date.parse(notBeforeIso ?? "");
 if (!Number.isFinite(notBeforeMs)) fail("invalid release cutoff timestamp");
@@ -47,7 +50,8 @@ for (const line of rawLogs.split(/\r?\n/)) {
       const event = JSON.parse(message.slice(prefixIndex + HEALTH_PREFIX.length));
       if (event.event === "confirmed-push"
         && event.source === expectedSourceRevision
-        && event.releaseId === expectedReleaseId) {
+        && event.releaseId === expectedReleaseId
+        && event.oraclePriceSource === expectedOraclePriceSource) {
         matchingEvent = { timestamp, legacy: false };
       }
     } catch {

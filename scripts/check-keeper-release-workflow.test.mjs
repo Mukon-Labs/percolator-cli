@@ -27,6 +27,15 @@ test("release requires a release-specific confirmed push and includes one explic
   assert.match(workflow, /exit 1/);
 });
 
+test("release pins and proves the selected oracle source and restores it on rollback", () => {
+  assert.match(workflow, /oracle_price_source:/);
+  assert.match(workflow, /ORACLE_PRICE_SOURCE: \$\{\{ inputs\.oracle_price_source \}\}/);
+  assert.match(workflow, /old_oracle_price_source=/);
+  assert.match(workflow, /--env "ORACLE_PRICE_SOURCE=\$\{ORACLE_PRICE_SOURCE\}"/);
+  assert.match(workflow, /--env "ORACLE_PRICE_SOURCE=\$\{\{ steps\.preflight\.outputs\.old_oracle_price_source \}\}"/);
+  assert.match(workflow, /prove_logs "\$GITHUB_SHA" "\$RELEASE_ID" "\$promotion_cutoff" strict "\$ORACLE_PRICE_SOURCE"/);
+});
+
 test("release gates promotion and success on operational audits with explicit floors", () => {
   const audits = workflow.match(/scripts\/check-current-market-health\.ts/g) ?? [];
   assert.equal(audits.length, 2, "workflow defines preflight and reusable post-update audits");

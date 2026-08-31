@@ -107,9 +107,11 @@ Normal code promotion uses only the protected GitHub workflow documented in
 the candidate while the old process remains live, rechecks the exact old
 source/image immediately before promotion, updates only that Machine, and
 requires a release-specific confirmed oracle push plus an operational audit.
+The dispatch also pins the exact non-secret `oracle_price_source`; the first
+confirmed-push marker must prove that same source before promotion succeeds.
 The dispatch must also pre-authorize one exact-image rollback; a failed
 candidate either proves the old image was never displaced or restores it and
-proves a fresh write.
+its previous oracle source, then proves a fresh write.
 
 Do not stage a normal keeper release on a stopped Machine. A stopped keeper
 freezes the market clock while cluster slots continue, turning the outage into
@@ -131,7 +133,7 @@ authorized read-only inspection, bounded Machine-specific logs should show the
 release marker followed by normal ticks:
 
 ```
-NINJA_KEEPER_HEALTH {"event":"confirmed-push",...}
+NINJA_KEEPER_HEALTH {"event":"confirmed-push","oraclePriceSource":"magicblock-demo",...}
 [12:20:30] SOL $80.77  BTC $61579  ETH $1721 push+crank ✓ ...
 ```
 

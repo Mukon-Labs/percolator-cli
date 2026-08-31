@@ -939,6 +939,7 @@ async function tickInner(signal: AbortSignal) {
         event: "confirmed-push",
         releaseId: RELEASE_ID,
         source: RELEASE_SOURCE,
+        oraclePriceSource,
       })}`);
     }
   }

@@ -25,6 +25,15 @@ on:
         description: Candidate release label, for example v31
         required: true
         type: string
+      oracle_price_source:
+        description: Exact oracle source the candidate keeper must run and prove
+        required: true
+        type: choice
+        default: pyth-solana-push
+        options:
+          - pyth-solana-push
+          - pyth-hermes
+          - magicblock-demo
       minimum_lp_risk_equity_usdc:
         description: Reviewed operational LP risk-equity floor in USDC
         required: true
@@ -61,6 +70,7 @@ jobs:
       EXPECTED_CURRENT_SOURCE: ${{ inputs.current_source_revision }}
       EXPECTED_CURRENT_DIGEST: ${{ inputs.current_image_digest }}
       RELEASE_VERSION: ${{ inputs.release_version }}
+      ORACLE_PRICE_SOURCE: ${{ inputs.oracle_price_source }}
       MINIMUM_LP_RISK_EQUITY_USDC: ${{ inputs.minimum_lp_risk_equity_usdc }}
       MINIMUM_DOMAIN_INSURANCE_USDC: ${{ inputs.minimum_domain_insurance_usdc }}
       RELEASE_ID: ${{ github.run_id }}-${{ github.run_attempt }}
@@ -77,6 +87,10 @@ jobs:
           [[ "$EXPECTED_CURRENT_SOURCE" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_CURRENT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$RELEASE_VERSION" =~ ^v[0-9]+$ ]]
+          case "$ORACLE_PRICE_SOURCE" in
+            pyth-solana-push|pyth-hermes|magicblock-demo) ;;
+            *) exit 1 ;;
+          esac
           [[ "$MINIMUM_LP_RISK_EQUITY_USDC" =~ ^[0-9]+([.][0-9]{1,6})?$ ]]
           [[ "$MINIMUM_DOMAIN_INSURANCE_USDC" =~ ^[0-9]+([.][0-9]{1,6})?$ ]]
 
@@ -124,14 +138,20 @@ jobs:
           old_digest="$(jq -r '.ImageRef.digest // .image_ref.digest' <<< "$machine_json")"
           old_release_version="$(jq -r '.Config.metadata.release_version // .config.metadata.release_version // "unknown"' <<< "$machine_json")"
           old_source="$(jq -r '.Config.metadata.source_revision // .config.metadata.source_revision' <<< "$machine_json")"
+          old_oracle_price_source="$(jq -r '.Config.env.ORACLE_PRICE_SOURCE // .config.env.ORACLE_PRICE_SOURCE // "pyth-solana-push"' <<< "$machine_json")"
           [[ "$old_image" =~ ^registry[.]fly[.]io/[A-Za-z0-9._/-]+(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$ ]]
           [[ "$old_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$old_source" =~ ^[0-9a-f]{40}$ ]]
           [[ "$old_release_version" =~ ^[A-Za-z0-9._-]{1,32}$ ]]
+          case "$old_oracle_price_source" in
+            pyth-solana-push|pyth-hermes|magicblock-demo) ;;
+            *) exit 1 ;;
+          esac
           echo "old_image=${old_image}" >> "$GITHUB_OUTPUT"
           echo "old_digest=${old_digest}" >> "$GITHUB_OUTPUT"
           echo "old_release_version=${old_release_version}" >> "$GITHUB_OUTPUT"
           echo "old_source=${old_source}" >> "$GITHUB_OUTPUT"
+          echo "old_oracle_price_source=${old_oracle_price_source}" >> "$GITHUB_OUTPUT"
 
       - name: Build and pin the candidate image while the old keeper remains live
         id: candidate
@@ -206,6 +226,7 @@ jobs:
             local release_id="$2"
             local cutoff="$3"
             local proof_mode="$4"
+            local oracle_price_source="$5"
             local log_file="$RUNNER_TEMP/keeper-release-logs.jsonl"
             for _attempt in $(seq 1 24); do
               flyctl logs \
@@ -214,7 +235,7 @@ jobs:
                 --json \
                 --no-tail > "$log_file"
               if node scripts/verify-keeper-release-log.mjs \
-                  "$EXPECTED_MACHINE_ID" "$source_revision" "$release_id" "$cutoff" "$proof_mode" \
+                  "$EXPECTED_MACHINE_ID" "$source_revision" "$release_id" "$cutoff" "$proof_mode" "$oracle_price_source" \
                   < "$log_file"; then
                 return 0
               fi
@@ -254,6 +275,7 @@ jobs:
             --image "${{ steps.candidate.outputs.candidate_image }}" \
             --metadata "release_version=${RELEASE_VERSION}" \
             --metadata "source_revision=${GITHUB_SHA}" \
+            --env "ORACLE_PRICE_SOURCE=${ORACLE_PRICE_SOURCE}" \
             --wait-timeout 300 \
             --yes
           update_status=$?
@@ -261,7 +283,7 @@ jobs:
 
           if [[ $update_status -eq 0 ]] \
             && prove_status "$GITHUB_SHA" "${{ steps.candidate.outputs.candidate_digest }}" \
-            && prove_logs "$GITHUB_SHA" "$RELEASE_ID" "$promotion_cutoff" strict \
+            && prove_logs "$GITHUB_SHA" "$RELEASE_ID" "$promotion_cutoff" strict "$ORACLE_PRICE_SOURCE" \
             && audit_market "Post-promotion"; then
             echo "Promotion proved one started Machine, a fresh confirmed push, and operational health." >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -269,7 +291,7 @@ jobs:
 
           echo "Candidate postcheck failed; checking whether the old running image was untouched." >> "$GITHUB_STEP_SUMMARY"
           if prove_status "${{ steps.preflight.outputs.old_source }}" "${{ steps.preflight.outputs.old_digest }}" \
-            && prove_logs "${{ steps.preflight.outputs.old_source }}" "$RELEASE_ID" "$promotion_cutoff" legacy-rollback; then
+            && prove_logs "${{ steps.preflight.outputs.old_source }}" "$RELEASE_ID" "$promotion_cutoff" legacy-rollback "${{ steps.preflight.outputs.old_oracle_price_source }}"; then
             echo "The old image remained live; no rollback mutation was needed." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
@@ -280,10 +302,11 @@ jobs:
             --image "${{ steps.preflight.outputs.old_image }}" \
             --metadata "release_version=${{ steps.preflight.outputs.old_release_version }}" \
             --metadata "source_revision=${{ steps.preflight.outputs.old_source }}" \
+            --env "ORACLE_PRICE_SOURCE=${{ steps.preflight.outputs.old_oracle_price_source }}" \
             --wait-timeout 300 \
             --yes
           prove_status "${{ steps.preflight.outputs.old_source }}" "${{ steps.preflight.outputs.old_digest }}"
-          prove_logs "${{ steps.preflight.outputs.old_source }}" "$RELEASE_ID" "$rollback_cutoff" legacy-rollback
+          prove_logs "${{ steps.preflight.outputs.old_source }}" "$RELEASE_ID" "$rollback_cutoff" legacy-rollback "${{ steps.preflight.outputs.old_oracle_price_source }}"
           audit_market "Post-rollback"
           echo "Candidate failed; one authorized rollback restored the old started image and a fresh push+crank." >> "$GITHUB_STEP_SUMMARY"
           exit 1

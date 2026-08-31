@@ -7,6 +7,7 @@ const MACHINE = "d891e161f73358";
 const SOURCE = "ff04d64d3fef19057370111f7294c1ca24d0020b";
 const RELEASE = "123456-1";
 const CUTOFF = "2026-08-26T03:00:00.000Z";
+const ORACLE_PRICE_SOURCE = "magicblock-demo";
 
 function line({
   timestamp = "2026-08-26T03:00:01.000Z",
@@ -14,19 +15,20 @@ function line({
   source = SOURCE,
   releaseId = RELEASE,
   event = "confirmed-push",
+  oraclePriceSource = ORACLE_PRICE_SOURCE,
   message,
 } = {}) {
   return JSON.stringify({
     timestamp,
     instance,
-    message: message ?? `NINJA_KEEPER_HEALTH ${JSON.stringify({ event, source, releaseId })}`,
+    message: message ?? `NINJA_KEEPER_HEALTH ${JSON.stringify({ event, source, releaseId, oraclePriceSource })}`,
   });
 }
 
-function verify(input, mode = "strict") {
+function verify(input, mode = "strict", oraclePriceSource = ORACLE_PRICE_SOURCE) {
   return spawnSync(
     process.execPath,
-    [verifier.pathname, MACHINE, SOURCE, RELEASE, CUTOFF, mode],
+    [verifier.pathname, MACHINE, SOURCE, RELEASE, CUTOFF, mode, oraclePriceSource],
     { encoding: "utf8", input },
   );
 }
@@ -44,6 +46,7 @@ test("rejects stale, wrong-machine, wrong-source, wrong-release, and wrong-event
     line({ source: "a".repeat(40) }),
     line({ releaseId: "other-1" }),
     line({ event: "keeper-start" }),
+    line({ oraclePriceSource: "pyth-solana-push" }),
   ]) {
     const result = verify(candidate);
     assert.notEqual(result.status, 0);
@@ -74,4 +77,10 @@ test("legacy rollback mode accepts only a fresh exact-machine push+crank", () =>
     message: "  [02:59:59] push+crank ✓ signature…",
   }), "legacy-rollback");
   assert.notEqual(stale.status, 0);
+});
+
+test("rejects an invalid expected oracle source", () => {
+  const result = verify(line(), "strict", "anything");
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /invalid oracle price source/);
 });
