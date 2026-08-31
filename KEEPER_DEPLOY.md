@@ -1,6 +1,6 @@
 # Oracle Keeper — Hosting Guide (Fly.io)
 
-The keeper pushes validated Pyth prices to the SOL / BTC / ETH v16 asset slots on devnet.
+The keeper pushes validated provider prices to the SOL / BTC / ETH v16 asset slots on devnet.
 If it stops, those markets freeze (no fresh oracle → trades revert / show stale PnL).
 This runs it 24/7 on Fly.io — the same platform as mukon-messengr.
 
@@ -15,6 +15,31 @@ rotation, and rate-limit incidents attributable.
 - **QuickNode**: https://quicknode.com → create a Solana devnet endpoint
 
 ## 2. Select the price source and prepare server-only credentials
+
+`ORACLE_PRICE_SOURCE` is the top-level selector. When it is unset, the existing
+`PYTH_PRICE_SOURCE=solana-push|hermes` behavior remains fully backward
+compatible and sponsored Pyth remains the default.
+
+For MagicBlock development and Builders Week testing, select
+`ORACLE_PRICE_SOURCE=magicblock-demo`. The keeper performs one batched read of
+MagicBlock's documented public SOL, BTC and ETH accounts through the fixed
+credential-free `https://devnet.magicblock.app` endpoint. It pins the oracle
+program, each feed address, deployed zero-authority account shape, account discriminator,
+Full-verification marker and magnitude exponent, rejects a batch when any feed
+is missing or older than 60 seconds, and bounds confidence and price values
+before creating the existing v16 AuthMark instructions. ZEC remains Recovery /
+Coming Soon.
+
+This mode needs no MagicBlock API token, subscription signer or browser
+connection. It is a public demonstration service backed by MagicBlock's
+real-time pricing-oracle repository, currently populated from Pyth Lazer. Its
+on-chain program source authorizes a fixed MagicBlock writer; the delegated public
+accounts store the zero key in their compatibility `write_authority` field. It does not independently
+verify the embedded upstream signature fields in `update_price_feed`. Therefore
+this mode trusts MagicBlock as the oracle publisher and has no documented
+production SLA. It is approved only as an explicit dev/test source. Production
+trading must stay disabled until an SLA-backed, program-native verification
+package is reviewed.
 
 Devnet defaults to `PYTH_PRICE_SOURCE=solana-push`. It reads Pyth's sponsored
 shard-0 SOL/BTC/ETH accounts through the existing keeper RPC, so no Pyth API
@@ -135,7 +160,8 @@ after that the keeper performs a bounded probe rather than sleeping forever.
 See `.env.example`. `RPC_URL` must be a dedicated keeper endpoint,
 `KEEPER_SECRET_KEY` must be the existing oracle-authority signer (not LP,
 upgrade, browser, or mint-authority material). `PYTH_PRICE_SOURCE` defaults to
-`solana-push`; `PYTH_API_KEY` is required only for explicit `hermes` mode and
+`solana-push`; `ORACLE_PRICE_SOURCE=magicblock-demo` explicitly selects the
+credential-free MagicBlock development source. `PYTH_API_KEY` is required only for explicit `hermes` mode and
 must remain server-only. Optional
 `PROGRAM_ID`, `MARKET`, and `LP_PORTFOLIO` overrides must match the intended
 v16 deployment. `PYTH_PUSH_MAX_AGE_SECS` (default and maximum 300) and
@@ -156,11 +182,13 @@ override them in runtime secret stores.
 
 ## Local dev
 
-Local development in sponsored-account mode requires explicit `RPC_URL` and
-`KEEPER_SECRET_KEY`; there is no Solana CLI-identity fallback. Hermes mode also
-requires `PYTH_API_KEY`:
+Local development in sponsored-account or MagicBlock-demo mode requires
+explicit `RPC_URL` and `KEEPER_SECRET_KEY`; there is no Solana CLI-identity
+fallback. Hermes mode also requires `PYTH_API_KEY`. The credential-free
+MagicBlock source itself can be checked without a signer or transaction:
 
 ```bash
+npm run check:magicblock-prices
 npm run keeper
 ```
 

@@ -95,6 +95,18 @@ import {
   validatePythPrice,
   type AvailablePythPushPrices,
 } from "./pyth-solana-push.ts";
+import {
+  MAGICBLOCK_DEMO_RPC_URL,
+  MagicBlockPriceIntegrityError,
+  MagicBlockPriceUnavailableError,
+  readMagicBlockDemoPrices,
+  requireMagicBlockDemoConfiguration,
+  type ValidatedMagicBlockPrice,
+} from "./magicblock-demo-prices.ts";
+import {
+  assertOracleSourceLifecycleCompatibility,
+  requireOraclePriceSource,
+} from "./oracle-price-source.ts";
 
 const keeperConfiguration = requireKeeperConfiguration(process.env as {
   RPC_URL?: string;
@@ -102,9 +114,16 @@ const keeperConfiguration = requireKeeperConfiguration(process.env as {
 });
 const KEEPER_MODE = keeperModeFromEnv(process.env);
 const RPC_URL = keeperConfiguration.rpcUrl;
-const pythPriceSource = requirePythPriceSourceConfiguration(process.env);
-const pythHermes = pythPriceSource.source === "hermes"
+const oraclePriceSource = requireOraclePriceSource(process.env);
+const pythPriceSource = requirePythPriceSourceConfiguration({
+  ...process.env,
+  PYTH_PRICE_SOURCE: oraclePriceSource === "pyth-hermes" ? "hermes" : "solana-push",
+});
+const pythHermes = oraclePriceSource === "pyth-hermes"
   ? requirePythHermesConfiguration(process.env)
+  : null;
+const magicBlockDemoConfiguration = oraclePriceSource === "magicblock-demo"
+  ? requireMagicBlockDemoConfiguration(process.env)
   : null;
 const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID ?? "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq"
@@ -119,8 +138,8 @@ const ASSETS: Array<{ index: number; symbol: string; feedId: string }> = [
   { index: 2, symbol: "ETH", feedId: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace" },
   { index: 3, symbol: "ZEC", feedId: "be9b59d178f0d6a97ab4c343bff2aa69caa1eaae3e9048a65788c529b125bb24" },
 ];
-// ZEC remains visible as Coming Soon but is excluded until its provider feed
-// is explicitly entitled. It must not block the three available demo markets.
+// Every currently selectable source covers the three majors. ZEC remains
+// Recovery/Coming Soon and must not block their oracle cadence.
 const KEEPER_ASSETS = ASSETS.filter((asset) => asset.symbol !== "ZEC");
 const PUSH_INTERVAL_MS = 5000;
 const TICK_DEADLINE_MS = 20_000;   // hard cap on one tick, releases the guard
@@ -168,6 +187,17 @@ const conn = new Connection(RPC_URL, {
     signal: rpcOperationSignals.currentSignal() ?? options?.signal,
   }),
 });
+const magicBlockDemoConnection = oraclePriceSource === "magicblock-demo"
+  ? new Connection(MAGICBLOCK_DEMO_RPC_URL, {
+    commitment: "confirmed",
+    disableRetryOnRateLimit: true,
+    confirmTransactionInitialTimeout: TX_TIMEOUT_MS,
+    fetchMiddleware: (url, options, fetch) => fetch(url, {
+      ...(options ?? {}),
+      signal: rpcOperationSignals.currentSignal() ?? options?.signal,
+    }),
+  })
+  : null;
 const payer = loadKeypair();
 type PendingKeeperAction = KeeperAction | "crank-buffer-create";
 const pendingBroadcasts = new PendingBroadcastGate<{ action: PendingKeeperAction }>();
@@ -607,10 +637,10 @@ console.log("Oracle Keeper (v16, hardened v2) started");
 console.log(`  Program: ${PROGRAM_ID.toBase58()}`);
 console.log(`  Market:  ${MARKET.toBase58()}`);
 console.log(`  Active feeds: ${KEEPER_ASSETS.map((a) => `${a.index}=${a.symbol}`).join(", ")}`);
-console.log("  Unavailable:  3=ZEC (Coming Soon; no provider entitlement)");
+console.log("  Unavailable:  3=ZEC (Recovery / Coming Soon)");
 console.log(`  Auth:    ${payer.publicKey.toBase58()}`);
 console.log(`  Mode:    ${KEEPER_MODE}`);
-console.log(`  Prices:  ${pythPriceSource.source}${pythPriceSource.source === "solana-push" ? " (sponsored shard 0)" : ""}`);
+console.log(`  Prices:  ${oraclePriceSource}${oraclePriceSource === "pyth-solana-push" ? " (sponsored shard 0)" : ""}`);
 console.log(`  Release: ${RELEASE_SOURCE} (${RELEASE_ID})`);
 console.log(`  Recovery clock bound: ${MARKET_MAX_CLOCK_LAG_SLOTS} slots`);
 console.log(`  Push:    every ${PUSH_INTERVAL_MS}ms\n`);
@@ -641,6 +671,17 @@ interface AssetPushPlan {
   index: number;
   instruction: TransactionInstruction;
   display: string;
+}
+
+interface ValidatedOraclePrice {
+  priceE6: bigint;
+  displayPrice: number;
+  publishTime: number;
+}
+
+interface AvailableOraclePrices {
+  prices: Map<number, ValidatedOraclePrice | ValidatedMagicBlockPrice>;
+  unavailableIndexes: number[];
 }
 
 async function pushAssetsWithIsolation(
@@ -804,16 +845,50 @@ async function readHermesPrices(signal: AbortSignal): Promise<AvailablePythPushP
   return { feeds, unavailableIndexes: [...unavailable].sort((a, b) => a - b) };
 }
 
-async function readOraclePrices(signal: AbortSignal): Promise<AvailablePythPushPrices> {
+function indexPythPrices(result: AvailablePythPushPrices): AvailableOraclePrices {
+  const prices = new Map<number, ValidatedOraclePrice>();
+  for (const asset of KEEPER_ASSETS) {
+    const price = result.feeds.get(asset.feedId);
+    if (price) prices.set(asset.index, price);
+  }
+  return { prices, unavailableIndexes: result.unavailableIndexes };
+}
+
+async function readOraclePrices(signal: AbortSignal): Promise<AvailableOraclePrices> {
   if (signal.aborted) throw new KeeperFailure("cancelled", "oracle price read cancelled");
-  if (pythPriceSource.source === "hermes") return readHermesPrices(signal);
+  if (oraclePriceSource === "magicblock-demo") {
+    if (!magicBlockDemoConnection || !magicBlockDemoConfiguration) {
+      throw new KeeperFailure("unknown", "MagicBlock demo source is not configured");
+    }
+    try {
+      return {
+        prices: await readMagicBlockDemoPrices({
+          connection: magicBlockDemoConnection,
+          configuration: magicBlockDemoConfiguration,
+          nowSecs: Math.floor(Date.now() / 1000),
+        }),
+        unavailableIndexes: [],
+      };
+    } catch (error) {
+      if (error instanceof MagicBlockPriceIntegrityError) {
+        throw new KeeperFailure("provider_denied", error.message);
+      }
+      if (error instanceof MagicBlockPriceUnavailableError) {
+        throw new KeeperFailure("transport", error.message);
+      }
+      throw error;
+    }
+  }
+  if (oraclePriceSource === "pyth-hermes") {
+    return indexPythPrices(await readHermesPrices(signal));
+  }
   try {
-    return await readPythPushPrices({
+    return indexPythPrices(await readPythPushPrices({
       connection: conn,
       feeds: KEEPER_ASSETS,
       configuration: pythPriceSource,
       nowSecs: Math.floor(Date.now() / 1000),
-    });
+    }));
   } catch (error) {
     if (error instanceof PythPriceUnavailableError) {
       // Treat a complete sponsored-feed outage like a provider transport
@@ -831,16 +906,16 @@ async function tickInner(signal: AbortSignal) {
   if (unavailableKey !== lastUnavailableFeedSet) {
     lastUnavailableFeedSet = unavailableKey;
     if (feedResult.unavailableIndexes.length > 0) {
-      console.error(`  Pyth source unavailable for asset indexes ${unavailableKey}; healthy feeds remain active`);
+      console.error(`  ${oraclePriceSource} unavailable for asset indexes ${unavailableKey}; healthy feeds remain active`);
     } else {
-      console.log("  complete configured Pyth feed set restored");
+      console.log(`  complete configured ${oraclePriceSource} feed set restored`);
     }
   }
 
   const nowSlot = BigInt(await conn.getSlot("confirmed"));
   const plans: AssetPushPlan[] = [];
   for (const a of KEEPER_ASSETS) {
-    const item = feedResult.feeds.get(a.feedId);
+    const item = feedResult.prices.get(a.index);
     if (!item) continue;
     plans.push({
       index: a.index,
@@ -982,6 +1057,10 @@ async function boot(): Promise<void> {
     try {
       if (shutdown.signal.aborted) throw new KeeperFailure("cancelled", "keeper shutdown requested");
       await bootRunner.run((signal) => withRpcSignal(signal, async () => {
+        if (oraclePriceSource === "magicblock-demo") {
+          const assessment = await readLpHealth();
+          assertOracleSourceLifecycleCompatibility(oraclePriceSource, assessment.assets);
+        }
         await ensureCrankBuffer(signal);
         await reportLpHealth("startup", signal);
       }));
