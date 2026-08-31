@@ -27,15 +27,50 @@ for await (const chunk of process.stdin) {
   if (Buffer.byteLength(rawLogs, "utf8") > MAX_LOG_BYTES) fail("log response exceeds 4 MiB");
 }
 
-let matchingEvent = null;
-for (const line of rawLogs.split(/\r?\n/)) {
-  if (!line.trim()) continue;
-  let record;
-  try {
-    record = JSON.parse(line);
-  } catch {
-    continue;
+function parseLogRecords(input) {
+  const records = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    if (start < 0) {
+      if (char === "{") {
+        start = index;
+        depth = 1;
+      }
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === "\"") inString = false;
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          const record = JSON.parse(input.slice(start, index + 1));
+          if (record && typeof record === "object" && !Array.isArray(record)) records.push(record);
+        } catch {
+          // Malformed log records are not release proof.
+        }
+        start = -1;
+      }
+    }
   }
+  return records;
+}
+
+let matchingEvent = null;
+for (const record of parseLogRecords(rawLogs)) {
   const timestamp = record.timestamp ?? record.time ?? record.Timestamp;
   const timestampMs = Date.parse(typeof timestamp === "string" ? timestamp : "");
   if (!Number.isFinite(timestampMs) || timestampMs < notBeforeMs) continue;

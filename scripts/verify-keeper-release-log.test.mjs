@@ -63,6 +63,16 @@ test("ignores malformed and unrelated log lines", () => {
   assert.equal(result.status, 0, result.stderr);
 });
 
+test("accepts Fly's pretty-printed multi-object JSON stream", () => {
+  const input = [
+    JSON.stringify(JSON.parse(line({ message: "unrelated { application } log" })), null, 4),
+    JSON.stringify(JSON.parse(line()), null, 4),
+  ].join("\n");
+  const result = verify(input);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Verified release keeper write/);
+});
+
 test("legacy push text is rejected for a candidate release", () => {
   const result = verify(line({ message: "  [03:00:01] push+crank ✓ signature…" }));
   assert.notEqual(result.status, 0);
