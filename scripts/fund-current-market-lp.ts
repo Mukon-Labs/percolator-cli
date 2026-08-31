@@ -7,6 +7,7 @@
  * Required environment (entered manually; never committed):
  *   RPC_URL          private devnet endpoint
  *   LP_OWNER_KEYPAIR absolute path to the existing LP-owner keypair JSON
+ *   MINT_AUTHORITY_KEYPAIR only when --mint-shortfall is explicitly requested
  *
  * A broadcast requires both --amount-usdc and --broadcast.  The default run
  * signs and simulates only, so operators can inspect the exact live result
@@ -23,12 +24,18 @@ import {
   Transaction,
   TransactionInstruction,
 } from "@solana/web3.js";
-import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import {
+  createMintToInstruction,
+  getAssociatedTokenAddressSync,
+  getMint,
+  TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
 
 const PROGRAM_ID = new PublicKey("7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq");
 const MARKET = new PublicKey("DNhYhm8Pb2yRjTpk7SNXrevX8zNZ9eZuivxgxyNtwyPP");
 const LP_PORTFOLIO = new PublicKey("BWqxjf1GoYqRNZTy6h1txPxBtiiN9MyF5Hd2JtKYGVwS");
 const TEST_USDC_MINT = new PublicKey("5NDpr5JHMaW5ghyRTR5DyyEDpqVzbj5R4gfUJEFk3k1T");
+const DEVNET_HOSTS = new Set(["api.devnet.solana.com", "devnet.helius-rpc.com"]);
 const USDC_SCALE = 1_000_000n;
 const HEADER_LEN = 16;
 const PORTFOLIO_STATE_OFF = HEADER_LEN;
@@ -54,14 +61,32 @@ export function parseUsdcAmount(value: string | undefined): bigint {
   return amount;
 }
 
-export function parseArguments(args: readonly string[]): { amount: bigint; broadcast: boolean } {
+export function parseArguments(args: readonly string[]): {
+  amount: bigint;
+  broadcast: boolean;
+  mintShortfall: boolean;
+} {
   const amountIndex = args.indexOf("--amount-usdc");
   if (amountIndex === -1 || !args[amountIndex + 1]) fail("Pass --amount-usdc <amount> explicitly.");
   const amountValue = args[amountIndex + 1];
   const broadcast = args.includes("--broadcast");
-  const allowed = new Set(["--amount-usdc", amountValue, "--broadcast"]);
+  const mintShortfall = args.includes("--mint-shortfall");
+  const allowed = new Set(["--amount-usdc", amountValue, "--broadcast", "--mint-shortfall"]);
   if (args.some((arg) => !allowed.has(arg))) fail("Unknown argument.");
-  return { amount: parseUsdcAmount(amountValue), broadcast };
+  return { amount: parseUsdcAmount(amountValue), broadcast, mintShortfall };
+}
+
+export function assertDevnetRpc(rpcUrl: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(rpcUrl);
+  } catch {
+    fail("RPC_URL must be a complete http(s) URL.");
+  }
+  if ((parsed.protocol !== "https:" && parsed.protocol !== "http:")
+    || !DEVNET_HOSTS.has(parsed.hostname.toLowerCase())) {
+    fail("RPC_URL must be a devnet endpoint for this funding tool.");
+  }
 }
 
 export function assertCurrentLpPortfolio(
@@ -98,21 +123,28 @@ export function depositInstruction(owner: PublicKey, sourceAta: PublicKey, vault
   });
 }
 
-function loadKeypair(path: string): Keypair {
+export function transactionPrelude(): TransactionInstruction[] {
+  return [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+    ComputeBudgetProgram.requestHeapFrame({ bytes: 256 * 1024 }),
+  ];
+}
+
+function loadKeypair(path: string, role: string): Keypair {
   try {
     const raw = JSON.parse(fs.readFileSync(path, "utf8"));
-    if (!Array.isArray(raw) || raw.length !== 64) fail("LP_OWNER_KEYPAIR is unavailable or invalid.");
+    if (!Array.isArray(raw) || raw.length !== 64) fail(`${role} is unavailable or invalid.`);
     return Keypair.fromSecretKey(new Uint8Array(raw));
   } catch {
-    fail("LP_OWNER_KEYPAIR is unavailable or invalid.");
+    fail(`${role} is unavailable or invalid.`);
   }
 }
 
 async function main(): Promise<void> {
-  const { amount, broadcast } = parseArguments(process.argv.slice(2));
+  const { amount, broadcast, mintShortfall } = parseArguments(process.argv.slice(2));
   const rpcUrl = requiredEnv("RPC_URL");
-  if (!rpcUrl.startsWith("https://") && !rpcUrl.startsWith("http://")) fail("RPC_URL must be a complete http(s) URL.");
-  const lpOwner = loadKeypair(requiredEnv("LP_OWNER_KEYPAIR"));
+  assertDevnetRpc(rpcUrl);
+  const lpOwner = loadKeypair(requiredEnv("LP_OWNER_KEYPAIR"), "LP_OWNER_KEYPAIR");
   const connection = new Connection(rpcUrl, { commitment: "confirmed", disableRetryOnRateLimit: true });
   const lp = await connection.getAccountInfo(LP_PORTFOLIO, "confirmed");
   assertCurrentLpPortfolio(lp, lpOwner.publicKey);
@@ -121,19 +153,40 @@ async function main(): Promise<void> {
   const vaultAuthority = PublicKey.findProgramAddressSync([Buffer.from("vault"), MARKET.toBuffer()], PROGRAM_ID)[0];
   const vaultAta = getAssociatedTokenAddressSync(TEST_USDC_MINT, vaultAuthority, true);
   const sourceBalance = BigInt((await connection.getTokenAccountBalance(sourceAta, "confirmed")).value.amount);
-  if (sourceBalance < amount) fail("LP owner has insufficient test-USDC for the requested deposit.");
+  let mintInstruction: TransactionInstruction | undefined;
+  let mintAuthority: Keypair | undefined;
+  if (sourceBalance < amount) {
+    if (!mintShortfall) {
+      fail("LP owner has insufficient test-USDC; use --mint-shortfall with an explicit MINT_AUTHORITY_KEYPAIR.");
+    }
+    mintAuthority = loadKeypair(requiredEnv("MINT_AUTHORITY_KEYPAIR"), "MINT_AUTHORITY_KEYPAIR");
+    const mint = await getMint(connection, TEST_USDC_MINT, "confirmed", TOKEN_PROGRAM_ID);
+    if (!mint.mintAuthority?.equals(mintAuthority.publicKey)) {
+      fail("MINT_AUTHORITY_KEYPAIR is not the authority for the configured test-USDC mint.");
+    }
+    mintInstruction = createMintToInstruction(
+      TEST_USDC_MINT,
+      sourceAta,
+      mintAuthority.publicKey,
+      amount - sourceBalance,
+      [],
+      TOKEN_PROGRAM_ID,
+    );
+  }
 
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
   const tx = new Transaction({ feePayer: lpOwner.publicKey, recentBlockhash: blockhash }).add(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+    ...transactionPrelude(),
+    ...(mintInstruction ? [mintInstruction] : []),
     depositInstruction(lpOwner.publicKey, sourceAta, vaultAta, amount),
   );
-  tx.sign(lpOwner);
-  const simulation = await connection.simulateTransaction(tx, [lpOwner]);
+  const signers = mintAuthority ? [lpOwner, mintAuthority] : [lpOwner];
+  tx.sign(...signers);
+  const simulation = await connection.simulateTransaction(tx, signers);
   if (simulation.value.err) {
     fail(`LP deposit simulation failed: ${JSON.stringify(simulation.value.err)}; logs: ${simulation.value.logs?.slice(-16).join(" | ") ?? "no program logs"}`);
   }
-  console.log(`LP deposit simulation OK (${simulation.value.unitsConsumed ?? 0} CU).`);
+  console.log(`LP deposit simulation OK (${simulation.value.unitsConsumed ?? 0} CU${mintInstruction ? "; exact shortfall mint included" : ""}${broadcast ? "; broadcast preflight" : "; no tokens were minted or moved"}).`);
   if (!broadcast) return;
 
   const signature = await connection.sendRawTransaction(tx.serialize(), { maxRetries: 0, skipPreflight: false });
