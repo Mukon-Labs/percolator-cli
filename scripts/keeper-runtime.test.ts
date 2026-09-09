@@ -868,6 +868,37 @@ test("5s cadence / 20s budget model includes wall-slot accrual and partial deadl
   assert.equal(partial.orphanedConfirmations, 0);
 });
 
+test("self-heal obeys its one-transaction liveness budget and yields to the next price tick", async () => {
+  const controller = new AbortController();
+  const calls: number[] = [];
+  const completed = await runBoundedSelfHeal({
+    batchesPerTick: 1,
+    cranksPerBatch: 9,
+    signal: controller.signal,
+    runBatch: async (cranks) => {
+      calls.push(cranks);
+      return true;
+    },
+  });
+  assert.equal(completed, 1);
+  assert.deepEqual(calls, [9]);
+});
+
+test("self-heal stops immediately after a bounded batch yields", async () => {
+  const calls: number[] = [];
+  const completed = await runBoundedSelfHeal({
+    batchesPerTick: 4,
+    cranksPerBatch: 9,
+    signal: new AbortController().signal,
+    runBatch: async (cranks) => {
+      calls.push(cranks);
+      return false;
+    },
+  });
+  assert.equal(completed, 0);
+  assert.deepEqual(calls, [9]);
+});
+
 test("SingleTickRunner marks active before synchronous re-entrant work", async () => {
   const runner = new SingleTickRunner(fakeClock(), 20_000);
   let nestedStarted: boolean | undefined;

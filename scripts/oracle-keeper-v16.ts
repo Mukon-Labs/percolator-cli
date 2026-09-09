@@ -156,8 +156,12 @@ const LP_HEALTH_CHECK_MS = 5 * 60_000;
 const LP_FAILURE_HEALTH_CHECK_MS = 60_000;
 const LP_MIN_CAPITAL = parseUsdcFloor(process.env.LP_MIN_CAPITAL_USDC);
 const PORTFOLIO_ACCOUNT_LEN = 9411;
-const CATCHUP_TXS_PER_TICK = 4;    // self-heal budget per tick (~180 slots each)
+// Recovery is deliberately one transaction per normal oracle tick. A large
+// backlog on an empty market uses the guarded re-anchor; background catch-up
+// must never monopolize the singleton writer or starve fresh price pushes.
+const CATCHUP_TXS_PER_TICK = 1;
 const CATCHUP_CRANKS_PER_TX = 9;
+const CATCHUP_BATCH_DEADLINE_MS = 6_000;
 const SHADOW_DECISION_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const shadowDecisionLog = KEEPER_MODE === "shadow"
   ? new BoundedShadowDecisionLog(
@@ -478,15 +482,30 @@ async function selfHeal(pushed: number[], signal: AbortSignal): Promise<void> {
     cranksPerBatch: CATCHUP_CRANKS_PER_TX,
     signal,
     runBatch: async (cranksPerBatch) => {
-      const nowSlot = BigInt(await conn.getSlot("confirmed"));
-      const ixs = Array.from({ length: cranksPerBatch }, () => ixCrank(crankBuffer, pushed, nowSlot));
-      const { err } = await sendIxs(ixs, 1_400_000, signal, {
-        action: "loss-stale-heal",
-        assetIndexes: pushed,
-        observedSlot: nowSlot,
-      });
-      if (err) console.log("  self-heal tx rejected");
-      return err === null;
+      try {
+        return await runDeadlineBoundOperation({
+          parentSignal: signal,
+          timeoutMs: CATCHUP_BATCH_DEADLINE_MS,
+          work: (batchSignal) => rpcOperationSignals.run(batchSignal, async () => {
+            const nowSlot = BigInt(await conn.getSlot("confirmed"));
+            const ixs = Array.from(
+              { length: cranksPerBatch },
+              () => ixCrank(crankBuffer, pushed, nowSlot),
+            );
+            const { err } = await sendIxs(ixs, 1_400_000, batchSignal, {
+              action: "loss-stale-heal",
+              assetIndexes: pushed,
+              observedSlot: nowSlot,
+            });
+            if (err) console.log("  self-heal tx rejected");
+            return err === null;
+          }),
+        });
+      } catch (error) {
+        if (signal.aborted) throw error;
+        console.error(`  self-heal batch yielded: ${safeErrorMessage(error)}`);
+        return false;
+      }
     },
   });
 }

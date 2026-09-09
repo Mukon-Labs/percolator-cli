@@ -884,9 +884,9 @@ export async function ensureUsableCrankBuffer<T>(input: {
     : new KeeperFailure("onchain", "crank buffer was not created as a usable legless portfolio");
 }
 
-/** Preserve the deployed 4 x 9 loss-stale shape while making the bounded work
- * directly testable. Returning false stops this tick; another 5s tick can
- * continue catch-up without overlapping the still-active runner. */
+/** Run only the caller's explicit recovery budget. Returning false stops this
+ * tick; another ordinary oracle tick can continue without overlapping the
+ * still-active runner or starving fresh pushes. */
 export async function runBoundedSelfHeal(input: {
   batchesPerTick: number;
   cranksPerBatch: number;
