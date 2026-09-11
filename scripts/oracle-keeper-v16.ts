@@ -53,6 +53,7 @@ import {
   RpcOperationSignalScope,
   requireKeeperConfiguration,
   runDeadlineBoundOperation,
+  runHardDeadlineOperation,
   runBoundedSelfHeal,
   readV16RecoveryStatus,
   safeErrorMessage,
@@ -114,6 +115,7 @@ const keeperConfiguration = requireKeeperConfiguration(process.env as {
 });
 const KEEPER_MODE = keeperModeFromEnv(process.env);
 const RPC_URL = keeperConfiguration.rpcUrl;
+const RPC_HTTP_REQUEST_TIMEOUT_MS = 5_000;
 const oraclePriceSource = requireOraclePriceSource(process.env);
 const pythPriceSource = requirePythPriceSourceConfiguration({
   ...process.env,
@@ -142,7 +144,7 @@ const ASSETS: Array<{ index: number; symbol: string; feedId: string }> = [
 // Recovery/Coming Soon and must not block their oracle cadence.
 const KEEPER_ASSETS = ASSETS.filter((asset) => asset.symbol !== "ZEC");
 const PUSH_INTERVAL_MS = 5000;
-const TICK_DEADLINE_MS = 20_000;   // hard cap on one tick, releases the guard
+const TICK_DEADLINE_MS = 20_000;   // abort budget; a hard hang forces bounded restart
 const WATCHDOG_MS = 150_000;       // no successful push for this long -> exit(1)
 const WATCHDOG_FORCE_EXIT_MS = 10_000;
 const TX_TIMEOUT_MS = 8000;
@@ -186,9 +188,27 @@ const conn = new Connection(RPC_URL, {
   // The keeper owns the retry policy so provider failures cannot amplify.
   disableRetryOnRateLimit: true,
   confirmTransactionInitialTimeout: TX_TIMEOUT_MS,
-  fetchMiddleware: (url, options, fetch) => fetch(url, {
-    ...(options ?? {}),
-    signal: rpcOperationSignals.currentSignal() ?? options?.signal,
+  // fetchMiddleware only rewrites request arguments; a custom fetch is needed
+  // to put the actual HTTP request behind a wall-clock deadline.
+  fetch: (url, options) => runHardDeadlineOperation({
+    parentSignal: rpcOperationSignals.currentSignal()
+      ?? options?.signal
+      ?? new AbortController().signal,
+    timeoutMs: RPC_HTTP_REQUEST_TIMEOUT_MS,
+    work: async (requestSignal) => {
+      const response = await fetch(url, {
+        ...(options ?? {}),
+        signal: requestSignal,
+      });
+      // web3 reads the body after custom fetch resolves. Buffer it while the
+      // deadline signal is live so a headers-only response cannot hang later.
+      const body = await response.arrayBuffer();
+      return new Response(body, {
+        headers: response.headers,
+        status: response.status,
+        statusText: response.statusText,
+      });
+    },
   }),
 });
 const magicBlockDemoConnection = oraclePriceSource === "magicblock-demo"
@@ -196,9 +216,23 @@ const magicBlockDemoConnection = oraclePriceSource === "magicblock-demo"
     commitment: "confirmed",
     disableRetryOnRateLimit: true,
     confirmTransactionInitialTimeout: TX_TIMEOUT_MS,
-    fetchMiddleware: (url, options, fetch) => fetch(url, {
-      ...(options ?? {}),
-      signal: rpcOperationSignals.currentSignal() ?? options?.signal,
+    fetch: (url, options) => runHardDeadlineOperation({
+      parentSignal: rpcOperationSignals.currentSignal()
+        ?? options?.signal
+        ?? new AbortController().signal,
+      timeoutMs: RPC_HTTP_REQUEST_TIMEOUT_MS,
+      work: async (requestSignal) => {
+        const response = await fetch(url, {
+          ...(options ?? {}),
+          signal: requestSignal,
+        });
+        const body = await response.arrayBuffer();
+        return new Response(body, {
+          headers: response.headers,
+          status: response.status,
+          statusText: response.statusText,
+        });
+      },
     }),
   })
   : null;
@@ -487,11 +521,13 @@ async function selfHeal(pushed: number[], signal: AbortSignal): Promise<void> {
           parentSignal: signal,
           timeoutMs: CATCHUP_BATCH_DEADLINE_MS,
           work: (batchSignal) => rpcOperationSignals.run(batchSignal, async () => {
+            currentTickPhase = "self-heal-slot";
             const nowSlot = BigInt(await conn.getSlot("confirmed"));
             const ixs = Array.from(
               { length: cranksPerBatch },
               () => ixCrank(crankBuffer, pushed, nowSlot),
             );
+            currentTickPhase = "self-heal-transaction";
             const { err } = await sendIxs(ixs, 1_400_000, batchSignal, {
               action: "loss-stale-heal",
               assetIndexes: pushed,
@@ -568,7 +604,8 @@ async function marketNeedsCatchUp(
     return knownMarketNeedsCatchUp;
   }
   try {
-    const status = await runDeadlineBoundOperation({
+    currentTickPhase = "recovery-status";
+    const status = await runHardDeadlineOperation({
       parentSignal,
       timeoutMs: 5_000,
       work: fetchMarketRecoveryStatus,
@@ -642,6 +679,7 @@ async function reportLpHealth(
     nextLpHealthCheckMs = now + LP_HEALTH_CHECK_MS;
   }
   try {
+    currentTickPhase = "lp-health";
     const assessment = await readLpHealth();
     const message = `  [${context}] ${formatV16MarketHealth(assessment)}`;
     if (assessment.level === "healthy") console.log(message);
@@ -669,7 +707,11 @@ let healing = false;
 const rpcCircuit = new RpcCircuitBreaker(systemClock);
 const assetQuarantine = new AssetQuarantine(Date.now);
 const feedEntitlementQuarantine = new HermesFeedEntitlementQuarantine(Date.now);
-const tickRunner = new SingleTickRunner(systemClock, TICK_DEADLINE_MS);
+type KeeperTickPhase = "idle" | "oracle-read" | "slot-read" | "oracle-push"
+  | "lp-crank" | "lp-health" | "recovery-status" | "self-heal-slot"
+  | "self-heal-transaction";
+let currentTickPhase: KeeperTickPhase = "idle";
+const tickRunner = new SingleTickRunner(systemClock, TICK_DEADLINE_MS, onTickDeadline);
 const bootRunner = new SingleTickRunner(systemClock, TICK_DEADLINE_MS);
 const watchdog = new PushWatchdog(Date.now());
 const shutdown = new AbortController();
@@ -799,7 +841,7 @@ async function readHermesPrices(signal: AbortSignal): Promise<AvailablePythPushP
   if (!pythHermes) throw new KeeperFailure("unknown", "Hermes source is not configured");
   // Keep the Hermes operation signal alive through headers, body parsing, and
   // configured-feed validation; a headers-only response must not outlive tick.
-  const feedResult = await runDeadlineBoundOperation({
+  const feedResult = await runHardDeadlineOperation({
     parentSignal: signal,
     timeoutMs: 5000,
     work: (hermesSignal) => fetchAvailableHermesFeeds({
@@ -919,6 +961,7 @@ async function readOraclePrices(signal: AbortSignal): Promise<AvailableOraclePri
 }
 
 async function tickInner(signal: AbortSignal) {
+  currentTickPhase = "oracle-read";
   const feedResult = await readOraclePrices(signal);
 
   const unavailableKey = feedResult.unavailableIndexes.join(",");
@@ -931,6 +974,7 @@ async function tickInner(signal: AbortSignal) {
     }
   }
 
+  currentTickPhase = "slot-read";
   const nowSlot = BigInt(await conn.getSlot("confirmed"));
   const plans: AssetPushPlan[] = [];
   for (const a of KEEPER_ASSETS) {
@@ -943,6 +987,7 @@ async function tickInner(signal: AbortSignal) {
     });
   }
   // Tx 1: PUSHES ONLY — must always land, whatever the crank thinks.
+  currentTickPhase = "oracle-push";
   const push = await pushAssetsWithIsolation(plans, nowSlot, signal);
   const pushed = push.plans.map((plan) => plan.index);
   const parts = push.plans.map((plan) => plan.display);
@@ -967,6 +1012,7 @@ async function tickInner(signal: AbortSignal) {
   }
 
   // Tx 2: crank the LP (settles its legs, advances effective prices).
+  currentTickPhase = "lp-crank";
   const crank = await sendIxs([ixCrank(LP_PORTFOLIO, pushed, nowSlot)], 600_000, signal, {
     action: "lp-crank",
     assetIndexes: pushed,
@@ -1045,7 +1091,37 @@ async function tick() {
       transientBackoffUntil = Date.now() + backoff;
       console.error(`  Backing off ${(backoff / 1000).toFixed(0)}s…`);
     }
+  } finally {
+    if (!tickRunner.isActive()) currentTickPhase = "idle";
   }
+}
+
+function requestKeeperRestart(reason: string): void {
+  if (lifecycle.isTerminal()) return;
+  console.error(`KEEPER RESTART: ${reason}`);
+  const cancelForcedExit = scheduleForcedExit({
+    delayMs: WATCHDOG_FORCE_EXIT_MS,
+    code: 1,
+    exit: (code) => process.exit(code),
+  });
+  void lifecycle.terminate(async () => {
+    shutdown.abort();
+    tickRunner.abortActive();
+    bootRunner.abortActive();
+    await Promise.all([tickRunner.drain(), bootRunner.drain()]);
+  }, 1).finally(cancelForcedExit);
+}
+
+function onTickDeadline(): void {
+  const pending = pendingBroadcasts.snapshot();
+  console.error(
+    `TICK DEADLINE: phase=${currentTickPhase} pending=${pending?.context.action ?? "none"}`,
+  );
+  // With no retained signed bytes, a forced process restart cannot race a
+  // still-valid state transition. If a broadcast is pending, preserve the
+  // existing reconcile-or-expire gate and let the conservative watchdog own
+  // the eventual restart instead of signing a replacement too early.
+  if (!pending) requestKeeperRestart(`hung ${currentTickPhase} operation with no pending broadcast`);
 }
 
 // WATCHDOG: if pushes stop landing, die loudly — Fly restarts the machine.
@@ -1053,18 +1129,7 @@ lifecycle.every(() => {
   if (KEEPER_MODE === "shadow") return;
   if (Date.now() < watchdogSuppressedUntil) return;
   if (watchdog.shouldRestart(Date.now(), WATCHDOG_MS)) {
-    console.error(`WATCHDOG: no successful push for ${WATCHDOG_MS / 1000}s — exiting for restart`);
-    const cancelForcedExit = scheduleForcedExit({
-      delayMs: WATCHDOG_FORCE_EXIT_MS,
-      code: 1,
-      exit: (code) => process.exit(code),
-    });
-    void lifecycle.terminate(async () => {
-      shutdown.abort();
-      tickRunner.abortActive();
-      bootRunner.abortActive();
-      await Promise.all([tickRunner.drain(), bootRunner.drain()]);
-    }, 1).finally(cancelForcedExit);
+    requestKeeperRestart(`no successful push for ${WATCHDOG_MS / 1000}s`);
   }
 }, 15_000);
 

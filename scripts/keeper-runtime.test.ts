@@ -45,6 +45,7 @@ import {
   RpcCircuitBreaker,
   RpcOperationSignalScope,
   runDeadlineBoundOperation,
+  runHardDeadlineOperation,
   runBoundedSelfHeal,
   safeErrorMessage,
   scheduleForcedExit,
@@ -72,8 +73,7 @@ function fakeClock(startMs = 0, random = 0.5): Clock & { advance(ms: number): vo
 }
 
 const flush = async () => {
-  await Promise.resolve();
-  await Promise.resolve();
+  for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
 };
 
 function shadowInstruction(byte: number): TransactionInstruction {
@@ -504,15 +504,13 @@ test("real Connection custom-fetch fallback consumes only its exact owner abort 
   assert.deepEqual(await runRealConnectionFallbackRace("owner"), []);
 });
 
-test("real Connection custom-fetch fallback reports independent abort and transport exactly once", async () => {
-  assert.deepEqual(
-    await runRealConnectionFallbackRace("independent-abort"),
-    [formatConfirmationFallbackError(Object.assign(new Error("independent abort"), { name: "AbortError" }))],
-  );
-  assert.deepEqual(
-    await runRealConnectionFallbackRace("transport"),
-    [formatConfirmationFallbackError(new Error("connection reset https://provider.invalid/key"))],
-  );
+test("real Connection ignores abandoned fallback errors after a confirmed websocket outcome", async () => {
+  // Once the websocket has authoritatively confirmed the transaction, the
+  // owned abort settles the hard-bounded fallback first. A transport's later
+  // rejection is consumed by the deadline helper and must not become either
+  // an unhandled rejection or a false keeper warning.
+  assert.deepEqual(await runRealConnectionFallbackRace("independent-abort"), []);
+  assert.deepEqual(await runRealConnectionFallbackRace("transport"), []);
 });
 
 test("confirmation polling survives an early null and a missed websocket notification", async () => {
@@ -741,6 +739,59 @@ test("confirmation timeout and shutdown abort owned fallback work without orphan
   assert.equal(shutdownScope.currentSignal(), null);
 });
 
+test("confirmation returns when a status RPC ignores cancellation", async () => {
+  const clock = fakeClock();
+  const scope = new RpcOperationSignalScope();
+  const confirmation = confirmConnectionTransaction({
+    clock,
+    connection: {
+      getSignatureStatus: () => new Promise<unknown>(() => {}),
+      onSignature: () => 1,
+      removeSignatureListener: async () => undefined,
+    },
+    parentSignal: new AbortController().signal,
+    rpcReadTimeoutMs: 4_000,
+    runWithOperationSignal: (signal, work) => scope.run(signal, work),
+    strategy: { signature: "sig", blockhash: "blockhash", lastValidBlockHeight: 100 },
+    timeoutMs: 8_000,
+  });
+  await flush();
+  const readDeadline = clock.tasks.find((task) => task.delayMs === 4_000);
+  assert.ok(readDeadline);
+  readDeadline.callback();
+  await assert.rejects(
+    confirmation,
+    (error: unknown) => error instanceof KeeperFailure && error.kind === "timeout",
+  );
+  assert.equal(scope.currentSignal(), null);
+});
+
+test("confirmation does not hang when websocket cleanup ignores cancellation", async () => {
+  const clock = fakeClock();
+  const scope = new RpcOperationSignalScope();
+  const confirmation = confirmConnectionTransaction({
+    clock,
+    connection: {
+      getSignatureStatus: async () => ({
+        context: { slot: 1 },
+        value: { err: null, confirmationStatus: "confirmed" },
+      }),
+      onSignature: () => 1,
+      removeSignatureListener: () => new Promise<void>(() => {}),
+    },
+    parentSignal: new AbortController().signal,
+    runWithOperationSignal: (signal, work) => scope.run(signal, work),
+    strategy: { signature: "sig", blockhash: "blockhash", lastValidBlockHeight: 100 },
+    timeoutMs: 8_000,
+  });
+  await flush();
+  const cleanupDeadline = clock.tasks.find((task) => task.delayMs === 1_000);
+  assert.ok(cleanupDeadline);
+  cleanupDeadline.callback();
+  assert.deepEqual(await confirmation, { context: { slot: 1 }, value: { err: null } });
+  assert.equal(scope.currentSignal(), null);
+});
+
 test("deadline cancellation keeps the active tick serialized until its work settles", async () => {
   const clock = fakeClock();
   const runner = new SingleTickRunner(clock, 20_000);
@@ -758,6 +809,66 @@ test("deadline cancellation keeps the active tick serialized until its work sett
   deadline.callback();
   await assert.rejects(first, (error: unknown) => error instanceof KeeperFailure && error.kind === "cancelled");
   assert.equal(runner.isActive(), false);
+});
+
+test("hard deadline returns even when abandoned read work ignores cancellation", async () => {
+  const clock = fakeClock();
+  const observed: { operationSignal: AbortSignal | null } = { operationSignal: null };
+  let lateResolve!: (value: string) => void;
+  const result = runHardDeadlineOperation({
+    clock,
+    parentSignal: new AbortController().signal,
+    timeoutMs: 5_000,
+    work: (signal) => {
+      observed.operationSignal = signal;
+      return new Promise<string>((resolve) => { lateResolve = resolve; });
+    },
+  });
+  await flush();
+  assert.equal(observed.operationSignal?.aborted, false);
+  const deadline = clock.tasks.find((task) => task.delayMs === 5_000);
+  assert.ok(deadline);
+  deadline.callback();
+  await assert.rejects(
+    result,
+    (error: unknown) => error instanceof KeeperFailure && error.kind === "timeout",
+  );
+  assert.equal(observed.operationSignal?.aborted, true);
+  lateResolve("late read result");
+  await flush();
+});
+
+test("hard deadline rejects immediately on parent cancellation without starting work", async () => {
+  const parent = new AbortController();
+  parent.abort();
+  let started = false;
+  await assert.rejects(
+    runHardDeadlineOperation({
+      clock: fakeClock(),
+      parentSignal: parent.signal,
+      timeoutMs: 5_000,
+      work: async () => {
+        started = true;
+        return "unexpected";
+      },
+    }),
+    (error: unknown) => error instanceof KeeperFailure && error.kind === "cancelled",
+  );
+  assert.equal(started, false);
+});
+
+test("SingleTickRunner reports a permanently hung deadline without releasing serialization", async () => {
+  const clock = fakeClock();
+  let deadlineReports = 0;
+  const runner = new SingleTickRunner(clock, 20_000, () => { deadlineReports += 1; });
+  void runner.run(async () => new Promise<void>(() => {}));
+  await flush();
+  const deadline = clock.tasks.find((task) => task.delayMs === 20_000);
+  assert.ok(deadline);
+  deadline.callback();
+  assert.equal(deadlineReports, 1);
+  assert.equal(runner.isActive(), true);
+  assert.equal(await runner.run(async () => undefined), false);
 });
 
 test("Hermes deadline spans headers, body parsing, and validation for timeout and parent abort", async () => {

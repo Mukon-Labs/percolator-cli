@@ -266,6 +266,7 @@ export async function confirmConnectionTransaction(input: {
   connection: ConfirmationConnection;
   parentSignal: AbortSignal;
   pollIntervalMs?: number;
+  rpcReadTimeoutMs?: number;
   runWithOperationSignal<T>(signal: AbortSignal, work: () => Promise<T>): Promise<T>;
   reportUnexpectedFallbackError?: (message: string) => void;
   strategy: ConfirmationStrategy;
@@ -274,9 +275,23 @@ export async function confirmConnectionTransaction(input: {
   const linked = linkedAbortController(input.parentSignal);
   const confirmation = linked.controller;
   const clock = input.clock ?? systemClock;
+  const rpcReadTimeoutMs = Math.max(
+    250,
+    Math.min(input.rpcReadTimeoutMs ?? 4_000, input.timeoutMs),
+  );
   const timeout = clock.setTimeout(() => abortOwned(confirmation, "keeper transaction confirmation timed out"), input.timeoutMs);
   try {
     return await input.runWithOperationSignal(confirmation.signal, async () => {
+      const hardRead = <T>(work: () => Promise<T>) => runHardDeadlineOperation({
+        clock,
+        parentSignal: confirmation.signal,
+        timeoutMs: rpcReadTimeoutMs,
+        // The complete confirmation already owns the operation signal scope.
+        // A nested scope can restore the outer signal only after the returned
+        // confirmation has resolved. The hard deadline still releases this
+        // await even if the RPC ignores the outer abort.
+        work: async () => work(),
+      });
       let subscriptionId: number | null = null;
       let subscriptionDelivered = false;
       let settled = false;
@@ -324,7 +339,9 @@ export async function confirmConnectionTransaction(input: {
           let pollCount = 0;
           try {
             while (!settled && !confirmation.signal.aborted) {
-              const response = await input.connection.getSignatureStatus(input.strategy.signature);
+              const response = await hardRead(
+                () => input.connection.getSignatureStatus(input.strategy.signature),
+              );
               const result = fallbackConfirmationResult(response);
               if (result) {
                 settle(result);
@@ -334,15 +351,19 @@ export async function confirmConnectionTransaction(input: {
               pollCount += 1;
               const shouldCheckExpiry = pollCount === 1 || pollCount % 4 === 0;
               if (shouldCheckExpiry && input.connection.getBlockHeight) {
-                const blockHeight = await input.connection.getBlockHeight("confirmed");
+                const blockHeight = await hardRead(
+                  () => input.connection.getBlockHeight!("confirmed"),
+                );
                 if (blockHeight > input.strategy.lastValidBlockHeight) {
                   if (!input.connection.getSignatureStatuses) {
                     settle(undefined, new KeeperFailure("expired", "keeper transaction expired without a confirmed result"));
                     return;
                   }
-                  const historical = historicalConfirmationResult(await input.connection.getSignatureStatuses(
-                    [input.strategy.signature],
-                    { searchTransactionHistory: true },
+                  const historical = historicalConfirmationResult(await hardRead(
+                    () => input.connection.getSignatureStatuses!(
+                      [input.strategy.signature],
+                      { searchTransactionHistory: true },
+                    ),
                   ));
                   if (historical.result) {
                     settle(historical.result);
@@ -381,7 +402,15 @@ export async function confirmConnectionTransaction(input: {
         abortOwned(confirmation, "keeper transaction confirmation completed");
         if (subscriptionId !== null && !subscriptionDelivered) {
           try {
-            await input.connection.removeSignatureListener(subscriptionId);
+            const cleanupParent = new AbortController();
+            await runHardDeadlineOperation({
+              clock,
+              parentSignal: cleanupParent.signal,
+              timeoutMs: 1_000,
+              // Unsubscribe cannot mutate chain state, so it is safe to
+              // abandon after the hard deadline consumes a late rejection.
+              work: async () => input.connection.removeSignatureListener(subscriptionId!),
+            });
           } catch (error) {
             (input.reportUnexpectedFallbackError ?? console.error)(formatConfirmationFallbackError(error));
           }
@@ -517,6 +546,70 @@ export async function runDeadlineBoundOperation<T>(input: {
   }
 }
 
+/**
+ * Enforce a wall-clock deadline even when an RPC implementation ignores its
+ * AbortSignal. The caller must use this only where a late settlement cannot
+ * authorize a replacement state transition: read-only RPC work, cleanup, or
+ * a submission acknowledgement after the exact signed bytes have already
+ * been retained by PendingBroadcastGate.
+ *
+ * Promise.race attaches handlers to the abandoned work, so a late rejection
+ * is consumed. Aborting still gives a cooperative transport the opportunity
+ * to release sockets promptly, but the returned promise never depends on it.
+ */
+export async function runHardDeadlineOperation<T>(input: {
+  clock?: Pick<Clock, "clearTimeout" | "setTimeout">;
+  parentSignal: AbortSignal;
+  timeoutMs: number;
+  work(signal: AbortSignal): Promise<T>;
+}): Promise<T> {
+  const linked = linkedAbortController(input.parentSignal);
+  const operation = linked.controller;
+  const clock = input.clock ?? systemClock;
+  let deadlineExpired = false;
+  let removeAbortListener = () => {};
+  const stopped = new Promise<never>((_resolve, reject) => {
+    const onAbort = () => reject(new KeeperFailure(
+      input.parentSignal.aborted ? "cancelled" : "timeout",
+      input.parentSignal.aborted ? "keeper operation cancelled" : "keeper operation timed out",
+    ));
+    removeAbortListener = () => operation.signal.removeEventListener("abort", onAbort);
+    if (operation.signal.aborted) onAbort();
+    else operation.signal.addEventListener("abort", onAbort, { once: true });
+  });
+  const timeout = clock.setTimeout(() => {
+    deadlineExpired = true;
+    operation.abort();
+  }, input.timeoutMs);
+  const work = Promise.resolve().then(() => {
+    if (operation.signal.aborted) {
+      throw new KeeperFailure(
+        input.parentSignal.aborted ? "cancelled" : "timeout",
+        input.parentSignal.aborted ? "keeper operation cancelled" : "keeper operation timed out",
+      );
+    }
+    return input.work(operation.signal);
+  });
+  try {
+    return await Promise.race([work, stopped]);
+  } catch (error) {
+    if (operation.signal.aborted) {
+      throw new KeeperFailure(
+        input.parentSignal.aborted ? "cancelled" : "timeout",
+        input.parentSignal.aborted
+          ? "keeper operation cancelled"
+          : deadlineExpired ? "keeper operation timed out" : "keeper operation cancelled",
+      );
+    }
+    throw error;
+  } finally {
+    clock.clearTimeout(timeout);
+    removeAbortListener();
+    operation.abort();
+    linked.dispose();
+  }
+}
+
 /** Keep a supervisor-visible exit alive while an asynchronous drain is stuck.
  * Promises alone do not keep Node's event loop alive, so a watchdog needs this
  * timer to preserve its intended nonzero exit code. */
@@ -589,7 +682,11 @@ export class SingleTickRunner {
   private active: Promise<void> | null = null;
   private controller: AbortController | null = null;
 
-  constructor(private readonly clock: Clock = systemClock, private readonly budgetMs = 20_000) {}
+  constructor(
+    private readonly clock: Clock = systemClock,
+    private readonly budgetMs = 20_000,
+    private readonly onDeadline: () => void = () => {},
+  ) {}
 
   isActive(): boolean {
     return this.active !== null;
@@ -607,7 +704,10 @@ export class SingleTickRunner {
     if (this.active) return false;
     const controller = new AbortController();
     this.controller = controller;
-    const deadline = this.clock.setTimeout(() => controller.abort(), this.budgetMs);
+    const deadline = this.clock.setTimeout(() => {
+      controller.abort();
+      this.onDeadline();
+    }, this.budgetMs);
     let resolveActive!: () => void;
     let rejectActive!: (error: unknown) => void;
     const active = new Promise<void>((resolve, reject) => {
