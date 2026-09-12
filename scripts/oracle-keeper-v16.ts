@@ -20,6 +20,9 @@
  *    150s the process exits(1) and Fly restarts the machine. The v1 hang was
  *    an un-timeboxed await keeping the `isPushing` guard latched forever.
  *
+ * Current scheduling: push -> freshly planned bounded legless maintenance ->
+ * LP settlement. No 30s cached healthy decision or second recovery batch.
+ *
  * Env (Fly): RPC_URL, KEEPER_SECRET_KEY (base64 or JSON array).
  */
 import "dotenv/config";
@@ -31,7 +34,6 @@ import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import bs58 from "bs58";
 import {
   abortableSleep,
-  availableRecoveryNeedsCatchUp,
   classifyKeeperError,
   confirmConnectionTransaction,
   confirmedTransactionError,
@@ -44,7 +46,6 @@ import {
   KeeperLifecycle,
   KeeperFailure,
   isCustomProgramError,
-  marketRecoveryStatusProbeDue,
   parseRecoveryClockLagSlots,
   parseKeeperSecretKey,
   PendingBroadcastGate,
@@ -54,16 +55,14 @@ import {
   requireKeeperConfiguration,
   runDeadlineBoundOperation,
   runHardDeadlineOperation,
-  runBoundedSelfHeal,
-  readV16RecoveryStatus,
   safeErrorMessage,
   scheduleForcedExit,
   SingleTickRunner,
   systemClock,
   retryAfterMs,
   type ConfirmationStrategy,
-  type V16RecoveryStatus,
 } from "./keeper-runtime.ts";
+import { maintainBeforeLp, decodeMaintenanceResponse, type ClockMaintenancePlan } from "./keeper-maintenance.ts";
 import {
   AssetQuarantine,
   BoundedShadowDecisionLog,
@@ -150,7 +149,6 @@ const WATCHDOG_FORCE_EXIT_MS = 10_000;
 const TX_TIMEOUT_MS = 8000;
 const PENDING_WATCHDOG_GRACE_MS = 120_000;
 const MAX_BACKOFF_MS = 30_000;
-const MARKET_STATUS_CHECK_MS = 30_000;
 const MARKET_MAX_CLOCK_LAG_SLOTS = parseRecoveryClockLagSlots(
   process.env.MARKET_MAX_CLOCK_LAG_SLOTS,
 );
@@ -161,8 +159,6 @@ const PORTFOLIO_ACCOUNT_LEN = 9411;
 // Recovery is deliberately one transaction per normal oracle tick. A large
 // backlog on an empty market uses the guarded re-anchor; background catch-up
 // must never monopolize the singleton writer or starve fresh price pushes.
-const CATCHUP_TXS_PER_TICK = 1;
-const CATCHUP_CRANKS_PER_TX = 9;
 const CATCHUP_BATCH_DEADLINE_MS = 6_000;
 const SHADOW_DECISION_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const shadowDecisionLog = KEEPER_MODE === "shadow"
@@ -505,137 +501,47 @@ async function ensureCrankBuffer(signal: AbortSignal): Promise<void> {
   console.log(`  crank buffer ready: ${crankBuffer.toBase58()}`);
 }
 
-/** Bounded recovery: advance stale asset clocks via the legless buffer. */
-async function selfHeal(pushed: number[], signal: AbortSignal): Promise<void> {
-  if (KEEPER_MODE === "shadow" && !shadowCrankBufferUsable) {
-    console.error("  shadow self-heal skipped: crank buffer is unavailable");
-    return;
+/** Fresh after every successful push; no healthy-result cache. */
+async function fetchMaintenancePlan(
+  signal: AbortSignal, pushed: readonly number[], minimumContextSlot: bigint,
+): Promise<ClockMaintenancePlan> {
+  if (minimumContextSlot < 0n || minimumContextSlot > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new KeeperFailure("onchain", "maintenance minimum context is invalid");
   }
-  await runBoundedSelfHeal({
-    batchesPerTick: CATCHUP_TXS_PER_TICK,
-    cranksPerBatch: CATCHUP_CRANKS_PER_TX,
-    signal,
-    runBatch: async (cranksPerBatch) => {
-      try {
-        return await runDeadlineBoundOperation({
-          parentSignal: signal,
-          timeoutMs: CATCHUP_BATCH_DEADLINE_MS,
-          work: (batchSignal) => rpcOperationSignals.run(batchSignal, async () => {
-            currentTickPhase = "self-heal-slot";
-            const nowSlot = BigInt(await conn.getSlot("confirmed"));
-            const ixs = Array.from(
-              { length: cranksPerBatch },
-              () => ixCrank(crankBuffer, pushed, nowSlot),
-            );
-            currentTickPhase = "self-heal-transaction";
-            const { err } = await sendIxs(ixs, 1_400_000, batchSignal, {
-              action: "loss-stale-heal",
-              assetIndexes: pushed,
-              observedSlot: nowSlot,
-            });
-            if (err) console.log("  self-heal tx rejected");
-            return err === null;
-          }),
-        });
-      } catch (error) {
-        if (signal.aborted) throw error;
-        console.error(`  self-heal batch yielded: ${safeErrorMessage(error)}`);
-        return false;
-      }
-    },
-  });
-}
-
-/**
- * An ordinary LP crank can confirm after the loss-stale lock clears without
- * advancing every active asset clock. Probe at a bounded cadence and keep the
- * existing legless-buffer recovery active until both the lock and configured
- * clock-lag gate are healthy. A failed probe never suppresses price pushes;
- * once recovery was seen, continue bounded catch-up until a valid status read.
- */
-async function fetchMarketRecoveryStatus(signal: AbortSignal): Promise<V16RecoveryStatus> {
   const response = await fetch(RPC_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: "keeper-market-status",
-      method: "getAccountInfo",
-      params: [MARKET.toBase58(), { commitment: "confirmed", encoding: "base64" }],
-    }),
-    signal,
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: "keeper-maintenance", method: "getAccountInfo",
+      params: [MARKET.toBase58(), { commitment: "confirmed", encoding: "base64",
+        minContextSlot: Number(minimumContextSlot) }] }), signal,
   });
-  if (!response.ok) {
-    throw new KeeperFailure(
-      response.status === 429 ? "rate_limit" : "transport",
-      `market status HTTP ${response.status}`,
-      retryAfterMs(response.headers, Date.now()),
-    );
-  }
-  const payload: unknown = await response.json();
-  const value = (payload as {
-    result?: { value?: { data?: unknown; owner?: unknown } | null };
-  })?.result?.value;
-  if (!value || value.owner !== PROGRAM_ID.toBase58()) {
-    throw new KeeperFailure("onchain", "v16 market status account owner is invalid");
-  }
-  const encoded = value.data;
-  if (!Array.isArray(encoded)
-    || typeof encoded[0] !== "string"
-    || encoded[1] !== "base64") {
-    throw new KeeperFailure("onchain", "v16 market status account is unavailable");
-  }
-  return readV16RecoveryStatus(
-    Buffer.from(encoded[0], "base64"),
-    MARKET.toBytes(),
-    MARKET_MAX_CLOCK_LAG_SLOTS,
-  );
+  if (!response.ok) throw new KeeperFailure(response.status === 429 ? "rate_limit" : "transport",
+    `maintenance status HTTP ${response.status}`, retryAfterMs(response.headers, Date.now()));
+  return decodeMaintenanceResponse(await response.json(), { expectedOwner: PROGRAM_ID.toBase58(),
+    expectedMarket: MARKET.toBytes(), minimumContextSlot,
+    pushedAssetIndexes: pushed });
 }
 
-async function marketNeedsCatchUp(
-  parentSignal: AbortSignal,
-  availableAssetIndexes: readonly number[],
-): Promise<boolean> {
-  // A healthy status suppresses recovery writes, but never permanently
-  // suppresses this bounded probe. Passive asset clocks can cross the limit
-  // without first producing Custom-21.
-  const now = Date.now();
-  if (!marketRecoveryStatusProbeDue(now, nextMarketStatusCheckMs)) {
-    return knownMarketNeedsCatchUp;
+async function maintainClocks(plan: ClockMaintenancePlan, signal: AbortSignal): Promise<void> {
+  if (KEEPER_MODE === "shadow" && !shadowCrankBufferUsable) {
+    throw new KeeperFailure("onchain", "shadow maintenance requires a usable legless buffer");
   }
-  try {
-    currentTickPhase = "recovery-status";
-    const status = await runHardDeadlineOperation({
-      parentSignal,
-      timeoutMs: 5_000,
-      work: fetchMarketRecoveryStatus,
-    });
-    const available = new Set(availableAssetIndexes);
-    const availableLagging = status.laggingAssetIndexes.filter((index) => available.has(index));
-    knownMarketNeedsCatchUp = availableRecoveryNeedsCatchUp(status, availableAssetIndexes);
-    nextMarketStatusCheckMs = now + MARKET_STATUS_CHECK_MS;
-    if (!status.lossStaleActive && status.laggingAssetIndexes.length > 0) {
-      console.log(
-        `  asset-clock recovery active: assets ${status.laggingAssetIndexes.join(",")}, max lag ${status.maxActiveAssetClockLag}`,
-      );
-      const blocked = status.laggingAssetIndexes.filter((index) => !available.has(index));
-      if (blocked.length > 0 && availableLagging.length === 0) {
-        console.error(`  asset-clock recovery waiting for unavailable oracle asset indexes ${blocked.join(",")}`);
+  currentTickPhase = "self-heal-transaction";
+  const startedAt = Date.now();
+  await runDeadlineBoundOperation({
+    parentSignal: signal, timeoutMs: CATCHUP_BATCH_DEADLINE_MS,
+    work: (batchSignal) => rpcOperationSignals.run(batchSignal, async () => {
+      const ixs = Array.from({ length: plan.cranks },
+        () => ixCrank(crankBuffer, plan.assetIndexes, plan.observedSlot));
+      const result = await sendIxs(ixs, 1_400_000, batchSignal, {
+        action: "loss-stale-heal", assetIndexes: plan.assetIndexes, observedSlot: plan.observedSlot,
+      });
+      if (result.err !== null) throw new KeeperFailure("onchain", "clock maintenance rejected");
+      if (KEEPER_MODE === "live" && !result.confirmed) {
+        throw new KeeperFailure("pending", "clock maintenance is not confirmed");
       }
-    }
-  } catch (error) {
-    if (parentSignal.aborted) throw error;
-    nextMarketStatusCheckMs = now + MARKET_STATUS_CHECK_MS;
-    const failure = classifyKeeperError(error, parentSignal);
-    // A temporary transport/rate-limit failure may safely preserve a previous
-    // valid recovery decision. Invalid owner/layout/identity must fail closed:
-    // retry the read later, but do not plan another recovery write from it.
-    if (failure.kind === "onchain" || failure.kind === "unknown") {
-      knownMarketNeedsCatchUp = false;
-    }
-    console.error(`  market recovery status unavailable: ${safeErrorMessage(failure)}`);
-  }
-  return knownMarketNeedsCatchUp;
+    }),
+  });
+  console.log(`  clock maintenance ${KEEPER_MODE === "shadow" ? "simulated" : "confirmed"}: cranks=${plan.cranks} debt=${plan.maxDebtSlots} cap=${plan.maxAccrualDtSlots} bounded=${plan.capped} unavailable=${plan.blockedAssetIndexes.join(",") || "none"} elapsedMs=${Date.now() - startedAt}`);
 }
 
 async function readLpHealth() {
@@ -703,7 +609,6 @@ console.log(`  Recovery clock bound: ${MARKET_MAX_CLOCK_LAG_SLOTS} slots`);
 console.log(`  Push:    every ${PUSH_INTERVAL_MS}ms\n`);
 
 let consecutiveErrors = 0;
-let healing = false;
 const rpcCircuit = new RpcCircuitBreaker(systemClock);
 const assetQuarantine = new AssetQuarantine(Date.now);
 const feedEntitlementQuarantine = new HermesFeedEntitlementQuarantine(Date.now);
@@ -722,8 +627,6 @@ const lifecycle = new KeeperLifecycle(
 );
 let watchdogSuppressedUntil = 0;
 let transientBackoffUntil = 0;
-let knownMarketNeedsCatchUp = false;
-let nextMarketStatusCheckMs = 0;
 let nextLpHealthCheckMs = 0;
 let nextLpFailureHealthCheckMs = 0;
 let lastUnavailableFeedSet = "";
@@ -1007,17 +910,24 @@ async function tickInner(signal: AbortSignal) {
       })}`);
     }
   }
-  if (shouldResetRpcCircuitAfterPush(KEEPER_MODE, push.confirmed)) {
-    rpcCircuit.recordConfirmedSuccess();
-  }
-
-  // Tx 2: crank the LP (settles its legs, advances effective prices).
-  currentTickPhase = "lp-crank";
-  const crank = await sendIxs([ixCrank(LP_PORTFOLIO, pushed, nowSlot)], 600_000, signal, {
-    action: "lp-crank",
-    assetIndexes: pushed,
-    observedSlot: nowSlot,
+  // Tx 2: bounded independent legless maintenance. Tx 3: LP settlement.
+  // A failed/uncertain maintenance transaction cannot fall through to LP work.
+  const crank = await maintainBeforeLp({
+    signal,
+    readPlan: () => {
+      currentTickPhase = "recovery-status";
+      return runHardDeadlineOperation({ parentSignal: signal, timeoutMs: 5_000,
+        work: (readSignal) => fetchMaintenancePlan(readSignal, pushed, nowSlot) });
+    },
+    maintain: (plan) => maintainClocks(plan, signal),
+    crankLp: async (plan) => {
+      currentTickPhase = "lp-crank";
+      return sendIxs([ixCrank(LP_PORTFOLIO, plan.assetIndexes, plan.observedSlot)], 600_000, signal, {
+        action: "lp-crank", assetIndexes: plan.assetIndexes, observedSlot: plan.observedSlot,
+      });
+    },
   });
+  if (!crank) throw new KeeperFailure("onchain", "no pushed active asset is available for maintenance");
   const time = new Date().toISOString().slice(11, 19);
   if (crank.err) {
     if (KEEPER_MODE === "shadow") {
@@ -1031,30 +941,18 @@ async function tickInner(signal: AbortSignal) {
       }
     }
     const isLossStale = isCustomProgramError(crank.err, 21);
-    console.log(`  [${time}] ${parts.join("  ")} ${KEEPER_MODE === "shadow" ? "shadow push simulated" : "push ✓"}, crank rejected${isLossStale ? " -> self-heal" : ""}`);
+    console.log(`  [${time}] ${parts.join("  ")} ${KEEPER_MODE === "shadow" ? "shadow push simulated" : "push ✓"}, crank rejected${isLossStale ? " -> replan next tick" : ""}`);
     await reportLpHealth("crank rejected", signal);
-    if (isLossStale && !healing) {
-      knownMarketNeedsCatchUp = true;
-      healing = true;
-      try { await selfHeal(pushed, signal); } finally { healing = false; }
-    }
+    // Never send a second maintenance batch in the same tick. Fresh state is
+    // replanned after the next push; all error/confirmation gates remain intact.
   } else {
     console.log(`  [${time}] ${parts.join("  ")} ${KEEPER_MODE === "shadow" ? "shadow push+crank simulated" : "push+crank ✓"} ${crank.sig.slice(0, 8)}…`);
     await reportLpHealth("periodic", signal);
-    // A normal LP crank can succeed without catching every asset clock up
-    // after a keeper outage. Continue bounded legless-buffer recovery until
-    // both the lock and every configured active-asset clock are healthy.
-    if (await marketNeedsCatchUp(signal, pushed)) {
-      if (!healing) {
-        healing = true;
-        try {
-          console.log("  market recovery pending -> self-heal");
-          await selfHeal(pushed, signal);
-        } finally {
-          healing = false;
-        }
-      }
-    }
+  }
+  // Do not erase repeated maintenance read/send failures just because the
+  // preceding price push succeeded. The watchdog still tracks pushes above.
+  if (shouldResetRpcCircuitAfterPush(KEEPER_MODE, push.confirmed)) {
+    rpcCircuit.recordConfirmedSuccess();
   }
   consecutiveErrors = 0;
 }

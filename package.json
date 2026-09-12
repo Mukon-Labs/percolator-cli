@@ -14,7 +14,7 @@
     "dev": "pnpm build && node dist/index.js",
     "start": "tsx scripts/oracle-keeper-v16.ts",
     "keeper": "tsx scripts/oracle-keeper-v16.ts",
-    "test:keeper-runtime": "tsx scripts/keeper-runtime.test.ts",
+    "test:keeper-runtime": "tsx scripts/keeper-runtime.test.ts && tsx scripts/keeper-maintenance.test.ts",
     "test:keeper-release": "node --test scripts/verify-fly-singleton.test.mjs scripts/verify-keeper-release-log.test.mjs scripts/check-keeper-release-workflow.test.mjs",
     "test:pyth-auth": "tsx scripts/pyth-hermes.test.ts && tsx scripts/pyth-solana-push.test.ts",
     "test:magicblock-prices": "tsx scripts/oracle-price-source.test.ts && tsx scripts/magicblock-demo-prices.test.ts",
