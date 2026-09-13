@@ -63,7 +63,7 @@ import {
   type ConfirmationStrategy,
 } from "./keeper-runtime.ts";
 import { maintainBeforeLp, decodeMaintenanceResponse, KeeperMaintenanceContinuation,
-  resumeBeforeFreshPush, admitFreshPush, type KeeperSendContext, type MaintenanceContinuation,
+  resumeBeforeFreshPush, admitFreshPush, maintenanceBatchLayout, type KeeperSendContext, type MaintenanceContinuation,
   type ClockMaintenancePlan } from "./keeper-maintenance.ts";
 import {
   AssetQuarantine,
@@ -533,27 +533,32 @@ async function fetchMaintenancePlan(
     pushedAssetIndexes: pushed });
 }
 
-async function maintainClocks(plan: ClockMaintenancePlan, signal: AbortSignal): Promise<void> {
+async function maintainClocks(plan: ClockMaintenancePlan, signal: AbortSignal) {
+  const layout = maintenanceBatchLayout(plan);
   if (KEEPER_MODE === "shadow" && !shadowCrankBufferUsable) {
     throw new KeeperFailure("onchain", "shadow maintenance requires a usable legless buffer");
   }
   currentTickPhase = "self-heal-transaction";
   const startedAt = Date.now();
-  await runDeadlineBoundOperation({
+  const result = await runDeadlineBoundOperation({
     parentSignal: signal, timeoutMs: CATCHUP_BATCH_DEADLINE_MS,
     work: (batchSignal) => rpcOperationSignals.run(batchSignal, async () => {
-      const ixs = Array.from({ length: plan.cranks },
+      const ixs = Array.from({ length: layout.leglessCranks },
         () => ixCrank(crankBuffer, plan.assetIndexes, plan.observedSlot));
+      if (layout.settlesLp) ixs.push(ixCrank(LP_PORTFOLIO, plan.assetIndexes, plan.observedSlot));
       const result = await sendIxs(ixs, 1_400_000, batchSignal, {
-        action: "loss-stale-heal", assetIndexes: plan.assetIndexes, observedSlot: plan.observedSlot,
+        action: layout.settlesLp ? "lp-crank" : "loss-stale-heal",
+        assetIndexes: plan.assetIndexes, observedSlot: plan.observedSlot,
       });
       if (result.err !== null) throw new KeeperFailure("onchain", "clock maintenance rejected");
       if (KEEPER_MODE === "live" && !result.confirmed) {
         throw new KeeperFailure("pending", "clock maintenance is not confirmed");
       }
+      return result;
     }),
   });
-  console.log(`  clock maintenance ${KEEPER_MODE === "shadow" ? "simulated" : "confirmed"}: cranks=${plan.cranks} debt=${plan.maxDebtSlots} cap=${plan.maxAccrualDtSlots} bounded=${plan.capped} unavailable=${plan.blockedAssetIndexes.join(",") || "none"} elapsedMs=${Date.now() - startedAt}`);
+  console.log(`  clock maintenance ${KEEPER_MODE === "shadow" ? "simulated" : "confirmed"}: cranks=${plan.cranks} lpAtomic=${layout.settlesLp} debt=${plan.maxDebtSlots} cap=${plan.maxAccrualDtSlots} bounded=${plan.capped} unavailable=${plan.blockedAssetIndexes.join(",") || "none"} elapsedMs=${Date.now() - startedAt}`);
+  return { ...result, settlesLp: layout.settlesLp };
 }
 
 async function readLpHealth() {
@@ -881,17 +886,16 @@ async function resumeMaintenance(work: MaintenanceContinuation, signal: AbortSig
   const crank = await maintainBeforeLp({
     signal,
     readPlan: () => runHardDeadlineOperation({ parentSignal: signal, timeoutMs: 5_000,
-      work: (readSignal) => fetchMaintenancePlan(readSignal, work.assetIndexes, work.minimumContextSlot) }),
-    maintain: plan => maintainClocks(plan, signal),
-    crankLp: plan => {
-      currentTickPhase = "lp-crank";
-      return sendIxs([ixCrank(LP_PORTFOLIO, plan.assetIndexes, plan.observedSlot)], 600_000, signal,
-        { action: "lp-crank", assetIndexes: plan.assetIndexes, observedSlot: plan.observedSlot });
-    },
+      work: (readSignal) => fetchMaintenancePlan(readSignal, KEEPER_ASSETS.map(a => a.index), work.minimumContextSlot) }),
+    runBatch: plan => maintainClocks(plan, signal),
   });
   if (!crank) throw new KeeperFailure("onchain", "no active confirmed-push continuation assets");
   if (crank.err !== null) throw new KeeperFailure("onchain", "resumed LP settlement rejected");
   if (!crank.confirmed) throw new KeeperFailure("pending", "resumed LP settlement not confirmed");
+  if (!crank.settlesLp) {
+    console.log("  bounded recovery confirmed; LP certification still pending");
+    return;
+  }
   console.log(`  resumed maintenance+LP confirmed ${crank.sig.slice(0, 8)}…`);
   await reportLpHealth("periodic", signal);
   rpcCircuit.recordConfirmedSuccess();
@@ -925,7 +929,7 @@ async function tickInner(signal: AbortSignal) {
     signal,
     readPlan: () => runHardDeadlineOperation({ parentSignal: signal, timeoutMs: 5_000,
       work: readSignal => fetchMaintenancePlan(readSignal, KEEPER_ASSETS.map(a => a.index), 0n) }),
-    maintain: plan => maintainClocks(plan, signal),
+    maintain: async plan => { await maintainClocks(plan, signal); },
     refreshFeed: async () => {
       currentTickPhase = "oracle-read";
       feedResult = await readOraclePrices(signal);
@@ -975,24 +979,22 @@ async function tickInner(signal: AbortSignal) {
     console.log(`  fresh push ${push.confirmed ? "confirmed; follow-up retained" : "simulated"} after pre-push maintenance; next tick required`);
     return;
   }
-  // Tx 2: bounded independent legless maintenance. Tx 3: LP settlement.
-  // A failed/uncertain maintenance transaction cannot fall through to LP work.
+  // Tx 2: bounded maintenance plus atomic LP certification. Capped batches
+  // are recovery-only; their continuation cannot claim LP health.
   const crank = await maintainBeforeLp({
     signal,
     readPlan: () => {
       currentTickPhase = "recovery-status";
       return runHardDeadlineOperation({ parentSignal: signal, timeoutMs: 5_000,
-        work: (readSignal) => fetchMaintenancePlan(readSignal, pushed, nowSlot) });
+        work: (readSignal) => fetchMaintenancePlan(readSignal, KEEPER_ASSETS.map(a => a.index), nowSlot) });
     },
-    maintain: (plan) => maintainClocks(plan, signal),
-    crankLp: async (plan) => {
-      currentTickPhase = "lp-crank";
-      return sendIxs([ixCrank(LP_PORTFOLIO, plan.assetIndexes, plan.observedSlot)], 600_000, signal, {
-        action: "lp-crank", assetIndexes: plan.assetIndexes, observedSlot: plan.observedSlot,
-      });
-    },
+    runBatch: plan => maintainClocks(plan, signal),
   });
   if (!crank) throw new KeeperFailure("onchain", "no pushed active asset is available for maintenance");
+  if (!crank.settlesLp) {
+    console.log("  bounded recovery completed; LP certification still pending");
+    return;
+  }
   const time = new Date().toISOString().slice(11, 19);
   if (crank.err) {
     if (KEEPER_MODE === "shadow") {

@@ -156,10 +156,23 @@ export function planClockMaintenance(input: {
     capped: assetIndexes.length > 0 && capped };
 }
 
+/** Normal upkeep certifies LP in its final instruction. Capped recovery keeps
+ * making bounded clock progress, but cannot claim a current LP certificate. */
+export function maintenanceBatchLayout(plan: ClockMaintenancePlan): {
+  leglessCranks: number; settlesLp: boolean;
+} {
+  if (!Number.isInteger(plan.cranks) || plan.cranks < 1 || plan.cranks > MAX_MAINTENANCE_CRANKS
+    || plan.assetIndexes.length === 0 || plan.blockedAssetIndexes.length !== 0
+    || plan.authMarkAssetIndexes.length !== plan.assetIndexes.length) {
+    throw new KeeperFailure("onchain", "maintenance batch requires all live configured AuthMark assets and a bounded plan");
+  }
+  return { leglessCranks: plan.capped ? plan.cranks : plan.cranks - 1, settlesLp: !plan.capped };
+}
+
 /** A delayed LP/idle period must not knowingly become an oversized new push.
- * A maintenance-only tick consumes the SAME batch budget as normal post-push
- * work. Never combine the two, refresh oracle timestamps, or settle the LP here.
- * The unchanged independent audit still handles execution-time latency. */
+ * Pre-push work uses the SAME batch budget as post-push work. Normal batches
+ * certify LP atomically; capped work is recovery-only. Neither refreshes oracle
+ * timestamps. The independent audit retains its limits. */
 export async function admitFreshPush(input: {
   signal: AbortSignal;
   readPlan(): Promise<ClockMaintenancePlan>;
@@ -197,14 +210,13 @@ export async function admitFreshPush(input: {
     observedSlot: after.observedSlot, maintenanceUsed: true };
 }
 
-/** One fresh plan and at most one independently committed maintenance batch.
- * Any read/send/confirmation failure prevents LP work; pending bytes remain
- * owned by the existing send gate. No cached decisions or second heal here. */
+/** One fresh plan and one atomic maintenance/LP (or capped recovery-only) batch.
+ * No separate LP send may expose an epoch/certificate gap. Pending bytes remain
+ * owned by the existing gate; no second batch or hidden retry. */
 export async function maintainBeforeLp<T>(input: {
   signal: AbortSignal;
   readPlan(): Promise<ClockMaintenancePlan>;
-  maintain(plan: ClockMaintenancePlan): Promise<void>;
-  crankLp(plan: ClockMaintenancePlan): Promise<T>;
+  runBatch(plan: ClockMaintenancePlan): Promise<T>;
 }): Promise<T | undefined> {
   const checkCancelled = () => {
     if (input.signal.aborted) throw new KeeperFailure("cancelled", "clock maintenance cancelled");
@@ -213,7 +225,7 @@ export async function maintainBeforeLp<T>(input: {
   const plan = await input.readPlan();
   checkCancelled();
   if (plan.cranks === 0) return undefined;
-  await input.maintain(plan);
+  const result = await input.runBatch(plan);
   checkCancelled();
-  return input.crankLp(plan);
+  return result;
 }

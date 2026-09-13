@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { planClockMaintenance, maintainBeforeLp, decodeMaintenanceResponse,
   KeeperMaintenanceContinuation, resumeBeforeFreshPush, admitFreshPush,
-  MAX_PRE_PUSH_MARKET_LAG, type KeeperSendContext } from "./keeper-maintenance.ts";
+  MAX_PRE_PUSH_MARKET_LAG, maintenanceBatchLayout, type KeeperSendContext } from "./keeper-maintenance.ts";
 import { KeeperFailure, SingleTickRunner, PendingBroadcastGate } from "./keeper-runtime.ts";
 
 function fixture(slots = [1000n, 1000n, 1000n], lifecycle = slots.map(() => 2)) {
@@ -106,41 +106,40 @@ test("legacy one-crank cadence accumulates debt at thirty slots/tick", () => {
   for(let i=0;i<6;i++){now+=30n;state+=20n;}
   assert.equal(now-state,60n);
 });
-test("one fresh plan, one independent batch, then LP in that order", async () => {
+test("one fresh plan sends exactly one atomic maintenance/LP batch", async () => {
   const calls:string[]=[]; const plan=planClockMaintenance(fixture());
   const result=await maintainBeforeLp({signal:new AbortController().signal,
     readPlan:async()=>{calls.push("read");return plan;},
-    maintain:async()=>{calls.push("maintain-confirmed");},
-    crankLp:async()=>{calls.push("lp");return 7;}});
-  assert.equal(result,7); assert.deepEqual(calls,["read","maintain-confirmed","lp"]);
+    runBatch:async()=>{calls.push("atomic-maintenance-lp");return 7;}});
+  assert.equal(result,7); assert.deepEqual(calls,["read","atomic-maintenance-lp"]);
 });
 for (const kind of ["rate_limit","pending","timeout","onchain"] as const) test(`${kind} stops LP and does not start a second batch`,async()=>{
-  let batches=0,lp=0;const failure=new KeeperFailure(kind,"test");
+  let batches=0;const failure=new KeeperFailure(kind,"test");
   await assert.rejects(maintainBeforeLp({signal:new AbortController().signal,
-    readPlan:async()=>planClockMaintenance(fixture()),maintain:async()=>{batches++;throw failure;},
-    crankLp:async()=>{lp++;}}),e=>e===failure);
-  assert.equal(batches,1);assert.equal(lp,0);
+    readPlan:async()=>planClockMaintenance(fixture()),runBatch:async()=>{batches++;throw failure;}}),e=>e===failure);
+  assert.equal(batches,1);
 });
 test("failed fresh read never reuses an earlier successful plan",async()=>{
   let sends=0;await assert.rejects(maintainBeforeLp({signal:new AbortController().signal,
     readPlan:async()=>{throw new KeeperFailure("rate_limit","probe");},
-    maintain:async()=>{sends++;},crankLp:async()=>{sends++;}}));assert.equal(sends,0);
+    runBatch:async()=>{sends++;}}));assert.equal(sends,0);
 });
-test("cancellation after maintenance prevents LP work",async()=>{
-  const c=new AbortController();let lp=0;
+test("cancellation after the atomic batch prevents caller success without a second send",async()=>{
+  const c=new AbortController();let sends=0;
   await assert.rejects(maintainBeforeLp({signal:c.signal,readPlan:async()=>planClockMaintenance(fixture()),
-    maintain:async()=>{c.abort();},crankLp:async()=>{lp++;}}));assert.equal(lp,0);
+    runBatch:async()=>{sends++;c.abort();}}));assert.equal(sends,1);
 });
-test("LP failure cannot roll back an independently confirmed batch or cause another batch",async()=>{
+test("atomic LP failure propagates without a second batch or separate LP retry",async()=>{
   let batches=0;
   await assert.rejects(maintainBeforeLp({signal:new AbortController().signal,readPlan:async()=>planClockMaintenance(fixture()),
-    maintain:async()=>{batches++;},crankLp:async()=>{throw new Error("LP failure");}}));assert.equal(batches,1);
+    runBatch:async()=>{batches++;throw new Error("LP failure");}}));assert.equal(batches,1);
 });
 test("production wiring performs maintenance after push and before LP without legacy cached heal",()=>{
   const source=readFileSync(new URL("./oracle-keeper-v16.ts",import.meta.url),"utf8");
   const s=source.slice(source.indexOf("async function tickInner"),source.indexOf("async function tick()"));
   assert.ok(s.indexOf("const push = await pushAssetsWithIsolation")<s.indexOf("const crank = await maintainBeforeLp"));
-  assert.match(s,/maintain: \(plan\) => maintainClocks\(plan, signal\)/);
+  assert.match(s,/runBatch: plan => maintainClocks\(plan, signal\)/);
+  assert.doesNotMatch(s,/sendIxs\(\[ixCrank\(LP_PORTFOLIO/);
   assert.doesNotMatch(s,/knownMarketNeedsCatchUp|nextMarketStatusCheckMs|await selfHeal/);
   assert.ok(s.indexOf("const crank = await maintainBeforeLp")<s.indexOf("if (shouldResetRpcCircuitAfterPush"));
 });
@@ -149,24 +148,79 @@ test("slow maintenance retains the singleton tick guard and original pending sig
   const runner=new SingleTickRunner(); const gate=new PendingBroadcastGate<string>();
   let release!:()=>void;const waiting=new Promise<void>(resolve=>{release=resolve;});
   let entered!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;});
-  let lp=0;
+  let sends=0;
   const first=runner.run(signal=>maintainBeforeLp({signal,
     readPlan:async()=>planClockMaintenance(fixture()),
-    maintain:async()=>{
+    runBatch:async()=>{
+      sends++;
       gate.record({context:"maintenance",rawTransaction:Uint8Array.of(1,2,3),
         strategy:{signature:"original",blockhash:"hash",lastValidBlockHeight:200}});
       entered();await waiting;throw new KeeperFailure("pending","still unconfirmed");
-    },crankLp:async()=>{lp++;}}));
+    }}));
   await started;
   assert.equal(await runner.run(async()=>{throw new Error("overlap");}),false);
   assert.equal(gate.snapshot()?.strategy.signature,"original");
   release();await assert.rejects(first);
-  assert.equal(lp,0);assert.equal(gate.snapshot()?.strategy.signature,"original");
+  assert.equal(sends,1);assert.equal(gate.snapshot()?.strategy.signature,"original");
   assert.throws(()=>gate.record({context:"replacement",rawTransaction:Uint8Array.of(4),
     strategy:{signature:"new",blockhash:"hash",lastValidBlockHeight:201}}));
 });
 
 const pushContext = (): KeeperSendContext => ({ action: "oracle-push", assetIndexes: [0, 1, 2], observedSlot: 1030n });
+
+test("normal batches reserve exactly one of nine crank instructions for LP",()=>{
+  const plan=planClockMaintenance(fixture());
+  for(let cranks=1;cranks<=9;cranks++) {
+    assert.deepEqual(maintenanceBatchLayout({...plan,cranks,capped:false}),{leglessCranks:cranks-1,settlesLp:true});
+    assert.deepEqual(maintenanceBatchLayout({...plan,cranks,capped:true}),{leglessCranks:cranks,settlesLp:false});
+  }
+  for(const bad of [{cranks:0},{cranks:10},{cranks:1.5},{assetIndexes:[]},
+    {blockedAssetIndexes:[3]},{authMarkAssetIndexes:[0]}]) {
+    assert.throws(()=>maintenanceBatchLayout({...plan,...bad}));
+  }
+});
+
+test("capped recovery retains continuation until an atomic LP batch is confirmed",()=>{
+  const c=new KeeperMaintenanceContinuation();c.recordConfirmed(pushContext(),null);
+  let now=1400n,slots=[1000n,1000n,1000n],completed=false,recovery=0;
+  for(let tick=0;tick<10;tick++) {
+    const f=fixture(slots);f.marketData.writeBigUInt64LE(now,464+581);f.contextSlot=now;f.minimumContextSlot=now;
+    const plan=planClockMaintenance(f),layout=maintenanceBatchLayout(plan);
+    const landing=now+30n;
+    slots=slots.map(s=>s+20n*BigInt(plan.cranks)>landing?landing:s+20n*BigInt(plan.cranks));
+    const action=layout.settlesLp?"lp-crank":"loss-stale-heal";
+    c.recordConfirmed({...pushContext(),action,observedSlot:now},null);
+    if(layout.settlesLp){assert.ok(slots.every(s=>s===landing));assert.equal(c.snapshot(),null);completed=true;break;}
+    recovery++;assert.ok(c.snapshot());assert.throws(()=>c.assertCanPush());now=landing+30n;
+  }
+  assert.ok(completed&&recovery>0);
+});
+
+test("late atomic confirmation consumes pending bytes and continuation exactly once",async()=>{
+  const c=new KeeperMaintenanceContinuation(),gate=new PendingBroadcastGate<KeeperSendContext>();
+  c.recordConfirmed(pushContext(),null);
+  gate.record({context:{...pushContext(),action:"lp-crank"},rawTransaction:Uint8Array.of(8,9),
+    strategy:{signature:"atomic-original",blockhash:"hash",lastValidBlockHeight:100}});
+  let resumes=0;
+  const result=await resumeBeforeFreshPush({signal:new AbortController().signal,continuation:c,
+    reconcile:async()=>{const p=gate.snapshot()!;c.recordConfirmed(p.context,null);},
+    resume:async()=>{resumes++;}});
+  assert.equal(result,false);assert.equal(resumes,0);assert.equal(c.snapshot(),null);
+  assert.equal(gate.snapshot()?.strategy.signature,"atomic-original"); // transport still owns bytes until its normal resolution
+});
+
+test("runtime couples LP and maintenance, retains capped continuation, and covers all configured live assets",()=>{
+  const s=readFileSync(new URL("./oracle-keeper-v16.ts",import.meta.url),"utf8");
+  const batch=s.slice(s.indexOf("async function maintainClocks"),s.indexOf("async function readLpHealth"));
+  assert.match(batch,/length: layout.leglessCranks/);
+  assert.match(batch,/if \(layout.settlesLp\) ixs.push\(ixCrank\(LP_PORTFOLIO/);
+  assert.match(batch,/sendIxs\(ixs, 1_400_000/);
+  assert.match(batch,/action: layout.settlesLp \? "lp-crank" : "loss-stale-heal"/);
+  assert.equal((batch.match(/sendIxs\(/g)??[]).length,1);
+  const entry=s.slice(s.indexOf("async function resumeMaintenance"),s.indexOf("async function tick()"));
+  assert.equal((entry.match(/if \(!crank.settlesLp\)/g)??[]).length,2);
+  assert.doesNotMatch(entry,/fetchMaintenancePlan\(readSignal, (pushed|work.assetIndexes)/);
+});
 
 test("continuation validates and copies confirmed push context; blocks replacement push", () => {
   const c = new KeeperMaintenanceContinuation(), context = pushContext();
