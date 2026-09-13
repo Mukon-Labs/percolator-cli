@@ -18,6 +18,75 @@ export interface ClockMaintenancePlan {
   capped: boolean;
 }
 
+export interface MaintenanceContinuation {
+  assetIndexes: number[];
+  minimumContextSlot: bigint;
+}
+
+export interface KeeperSendContext {
+  action: string;
+  assetIndexes: readonly number[];
+  observedSlot: bigint;
+}
+
+/** Logical follow-up work, not a second owner of signed bytes. Only a terminal
+ * confirmation may update it. It survives tick cancellation, not process exit. */
+export class KeeperMaintenanceContinuation {
+  private work: MaintenanceContinuation | null = null;
+
+  snapshot(): MaintenanceContinuation | null {
+    return this.work ? { ...this.work, assetIndexes: [...this.work.assetIndexes] } : null;
+  }
+
+  assertCanPush(): void {
+    if (this.work) throw new KeeperFailure("pending", "confirmed push still requires maintenance and LP settlement");
+  }
+
+  recordConfirmed(context: KeeperSendContext, err: unknown | null): void {
+    // Buffer initialization is tagged as heal by the legacy shadow recorder;
+    // an empty asset list must never create or finish price-follow-up work.
+    if (context.assetIndexes.length === 0) {
+      if (context.action === "oracle-push") throw new KeeperFailure("onchain", "confirmed push has no assets");
+      return;
+    }
+    if (context.action === "oracle-push") {
+      this.assertCanPush();
+      if (err !== null) return;
+      if (context.observedSlot < 0n || context.observedSlot > BigInt(Number.MAX_SAFE_INTEGER)
+        || new Set(context.assetIndexes).size !== context.assetIndexes.length
+        || context.assetIndexes.some(i => !Number.isSafeInteger(i) || i < 0 || i >= 8)) {
+        throw new KeeperFailure("onchain", "confirmed push continuation is invalid");
+      }
+      this.work = { assetIndexes: [...context.assetIndexes], minimumContextSlot: context.observedSlot };
+    } else if (context.action === "lp-crank" || (context.action === "loss-stale-heal" && err !== null)) {
+      // Confirmed rejection is definitive: allow a new feed cycle rather than
+      // indefinitely trying to maintain against a stale/rejected oracle mark.
+      this.work = null;
+    }
+  }
+}
+
+/** Reconcile before constructing ANY new oracle plan. A late confirmed push
+ * must consume its saved continuation, even when the new feed is unavailable. */
+export async function resumeBeforeFreshPush(input: {
+  signal: AbortSignal;
+  continuation: KeeperMaintenanceContinuation;
+  reconcile(): Promise<void>;
+  resume(work: MaintenanceContinuation): Promise<void>;
+}): Promise<boolean> {
+  const check = () => {
+    if (input.signal.aborted) throw new KeeperFailure("cancelled", "keeper continuation cancelled");
+  };
+  check();
+  await input.reconcile();
+  check();
+  const work = input.continuation.snapshot();
+  if (!work) return false;
+  await input.resume(work);
+  check();
+  return true;
+}
+
 /** Treat the RPC envelope as untrusted, including owner and context. */
 export function decodeMaintenanceResponse(payload: unknown, input: {
   expectedOwner: string; expectedMarket: Uint8Array; minimumContextSlot: bigint;

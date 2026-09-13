@@ -62,7 +62,9 @@ import {
   retryAfterMs,
   type ConfirmationStrategy,
 } from "./keeper-runtime.ts";
-import { maintainBeforeLp, decodeMaintenanceResponse, type ClockMaintenancePlan } from "./keeper-maintenance.ts";
+import { maintainBeforeLp, decodeMaintenanceResponse, KeeperMaintenanceContinuation,
+  resumeBeforeFreshPush, type KeeperSendContext, type MaintenanceContinuation,
+  type ClockMaintenancePlan } from "./keeper-maintenance.ts";
 import {
   AssetQuarantine,
   BoundedShadowDecisionLog,
@@ -234,7 +236,8 @@ const magicBlockDemoConnection = oraclePriceSource === "magicblock-demo"
   : null;
 const payer = loadKeypair();
 type PendingKeeperAction = KeeperAction | "crank-buffer-create";
-const pendingBroadcasts = new PendingBroadcastGate<{ action: PendingKeeperAction }>();
+const pendingBroadcasts = new PendingBroadcastGate<KeeperSendContext & { action: PendingKeeperAction }>();
+const maintenanceContinuation = new KeeperMaintenanceContinuation();
 let crankBuffer: PublicKey; // legless portfolio used only for catch-up cranks
 let shadowCrankBufferUsable = false;
 
@@ -314,13 +317,15 @@ async function reconcilePendingBroadcast(signal: AbortSignal): Promise<void> {
   });
   if (!resolved) return;
   const err = confirmedTransactionError(resolved.result);
+  maintenanceContinuation.recordConfirmed(resolved.context, err);
   const signaturePrefix = resolved.strategy.signature.slice(0, 8);
   if (err === null) {
     console.log(`  reconciled ${resolved.context.action} ${signaturePrefix}… at confirmed commitment`);
     if (resolved.context.action === "oracle-push") {
       watchdog.recordConfirmedPush(Date.now(), true);
       watchdogSuppressedUntil = 0;
-      rpcCircuit.recordConfirmedSuccess();
+      // A late push is not a completed healthy tick. Resume its maintenance
+      // before allowing another feed read/push or resetting failure history.
     }
   } else {
     console.error(`  reconciled ${resolved.context.action} ${signaturePrefix}… with an on-chain rejection`);
@@ -351,7 +356,12 @@ async function sendIxs(
   intent?: { action: KeeperAction; assetIndexes: readonly number[]; observedSlot: bigint },
 ): Promise<{ sig: string; err: unknown | null; confirmed: boolean }> {
   if (signal.aborted) throw new Error("keeper operation cancelled");
-  if (KEEPER_MODE === "live") await reconcilePendingBroadcast(signal);
+  // Reconciliation belongs at tick/boot entry, before instruction planning.
+  // Never confirm an old push here and silently submit a newly planned one.
+  if (KEEPER_MODE === "live" && pendingBroadcasts.hasPending()) {
+    throw new KeeperFailure("pending", "keeper transaction requires entry-point reconciliation");
+  }
+  if (KEEPER_MODE === "live" && intent?.action === "oracle-push") maintenanceContinuation.assertCanPush();
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
   if (signal.aborted) throw new Error("keeper operation cancelled");
   const tx = new Transaction();
@@ -400,7 +410,7 @@ async function sendIxs(
       if (signal.aborted) throw new KeeperFailure("cancelled", "keeper transaction submission cancelled");
       const action = intent?.action ?? "crank-buffer-create";
       pendingBroadcasts.record({
-        context: { action },
+        context: { action, assetIndexes: [...(intent?.assetIndexes ?? [])], observedSlot: intent?.observedSlot ?? 0n },
         rawTransaction,
         strategy: { signature: derivedSignature, blockhash, lastValidBlockHeight },
       });
@@ -418,7 +428,9 @@ async function sendIxs(
         signal,
       });
       if (!resolved) throw new KeeperFailure("unknown", "keeper pending broadcast disappeared before confirmation");
-      return { sig, err: confirmedTransactionError(resolved.result), confirmed: true };
+      const err = confirmedTransactionError(resolved.result);
+      maintenanceContinuation.recordConfirmed(resolved.context, err);
+      return { sig, err, confirmed: true };
     },
   });
   if (execution.mode === "live") return execution.value;
@@ -863,7 +875,35 @@ async function readOraclePrices(signal: AbortSignal): Promise<AvailableOraclePri
   }
 }
 
+async function resumeMaintenance(work: MaintenanceContinuation, signal: AbortSignal): Promise<void> {
+  // Freshly size bounded work. A late maintenance confirmation may itself be
+  // old by now; do not replay that transaction or use its cached slot/plan.
+  const crank = await maintainBeforeLp({
+    signal,
+    readPlan: () => runHardDeadlineOperation({ parentSignal: signal, timeoutMs: 5_000,
+      work: (readSignal) => fetchMaintenancePlan(readSignal, work.assetIndexes, work.minimumContextSlot) }),
+    maintain: plan => maintainClocks(plan, signal),
+    crankLp: plan => {
+      currentTickPhase = "lp-crank";
+      return sendIxs([ixCrank(LP_PORTFOLIO, plan.assetIndexes, plan.observedSlot)], 600_000, signal,
+        { action: "lp-crank", assetIndexes: plan.assetIndexes, observedSlot: plan.observedSlot });
+    },
+  });
+  if (!crank) throw new KeeperFailure("onchain", "no active confirmed-push continuation assets");
+  if (crank.err !== null) throw new KeeperFailure("onchain", "resumed LP settlement rejected");
+  if (!crank.confirmed) throw new KeeperFailure("pending", "resumed LP settlement not confirmed");
+  console.log(`  resumed maintenance+LP confirmed ${crank.sig.slice(0, 8)}…`);
+  await reportLpHealth("periodic", signal);
+  rpcCircuit.recordConfirmedSuccess();
+  consecutiveErrors = 0;
+}
+
 async function tickInner(signal: AbortSignal) {
+  if (KEEPER_MODE === "live" && await resumeBeforeFreshPush({
+    signal, continuation: maintenanceContinuation,
+    reconcile: () => reconcilePendingBroadcast(signal),
+    resume: work => resumeMaintenance(work, signal),
+  })) return;
   currentTickPhase = "oracle-read";
   const feedResult = await readOraclePrices(signal);
 
@@ -1040,6 +1080,7 @@ async function boot(): Promise<void> {
     try {
       if (shutdown.signal.aborted) throw new KeeperFailure("cancelled", "keeper shutdown requested");
       await bootRunner.run((signal) => withRpcSignal(signal, async () => {
+        if (KEEPER_MODE === "live") await reconcilePendingBroadcast(signal);
         if (oraclePriceSource === "magicblock-demo") {
           const assessment = await readLpHealth();
           assertOracleSourceLifecycleCompatibility(oraclePriceSource, assessment.assets);

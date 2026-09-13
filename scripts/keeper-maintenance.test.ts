@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { planClockMaintenance, maintainBeforeLp, decodeMaintenanceResponse } from "./keeper-maintenance.ts";
+import { planClockMaintenance, maintainBeforeLp, decodeMaintenanceResponse,
+  KeeperMaintenanceContinuation, resumeBeforeFreshPush, type KeeperSendContext } from "./keeper-maintenance.ts";
 import { KeeperFailure, SingleTickRunner, PendingBroadcastGate } from "./keeper-runtime.ts";
 
 function fixture(slots = [1000n, 1000n, 1000n], lifecycle = slots.map(() => 2)) {
@@ -135,7 +136,8 @@ test("LP failure cannot roll back an independently confirmed batch or cause anot
     maintain:async()=>{batches++;},crankLp:async()=>{throw new Error("LP failure");}}));assert.equal(batches,1);
 });
 test("production wiring performs maintenance after push and before LP without legacy cached heal",()=>{
-  const s=readFileSync(new URL("./oracle-keeper-v16.ts",import.meta.url),"utf8");
+  const source=readFileSync(new URL("./oracle-keeper-v16.ts",import.meta.url),"utf8");
+  const s=source.slice(source.indexOf("async function tickInner"),source.indexOf("async function tick()"));
   assert.ok(s.indexOf("const push = await pushAssetsWithIsolation")<s.indexOf("const crank = await maintainBeforeLp"));
   assert.match(s,/maintain: \(plan\) => maintainClocks\(plan, signal\)/);
   assert.doesNotMatch(s,/knownMarketNeedsCatchUp|nextMarketStatusCheckMs|await selfHeal/);
@@ -161,4 +163,115 @@ test("slow maintenance retains the singleton tick guard and original pending sig
   assert.equal(lp,0);assert.equal(gate.snapshot()?.strategy.signature,"original");
   assert.throws(()=>gate.record({context:"replacement",rawTransaction:Uint8Array.of(4),
     strategy:{signature:"new",blockhash:"hash",lastValidBlockHeight:201}}));
+});
+
+const pushContext = (): KeeperSendContext => ({ action: "oracle-push", assetIndexes: [0, 1, 2], observedSlot: 1030n });
+
+test("continuation validates and copies confirmed push context; blocks replacement push", () => {
+  const c = new KeeperMaintenanceContinuation(), context = pushContext();
+  c.recordConfirmed(context, null);
+  (context.assetIndexes as number[])[0] = 7;
+  c.snapshot()!.assetIndexes[1] = 7;
+  assert.deepEqual(c.snapshot(), { assetIndexes: [0, 1, 2], minimumContextSlot: 1030n });
+  assert.throws(() => c.assertCanPush());
+  assert.throws(() => c.recordConfirmed(pushContext(), null));
+  for (const bad of [{...pushContext(),assetIndexes:[]}, {...pushContext(),assetIndexes:[0,0]},
+    {...pushContext(),assetIndexes:[8]}, {...pushContext(),observedSlot:-1n}]) {
+    assert.throws(() => new KeeperMaintenanceContinuation().recordConfirmed(bad,null));
+  }
+});
+
+test("only terminal confirmation drives continuation, including rejection and boot isolation", () => {
+  const c = new KeeperMaintenanceContinuation();
+  c.recordConfirmed(pushContext(), {InstructionError:[2,21]}); assert.equal(c.snapshot(),null);
+  c.recordConfirmed({...pushContext(),action:"loss-stale-heal",assetIndexes:[]},null);
+  assert.equal(c.snapshot(),null);
+  c.recordConfirmed(pushContext(),null);
+  c.recordConfirmed({...pushContext(),action:"loss-stale-heal"},null);
+  assert.ok(c.snapshot());
+  c.recordConfirmed({...pushContext(),action:"lp-crank"},null);
+  assert.equal(c.snapshot(),null);
+  for (const action of ["loss-stale-heal","lp-crank"]) {
+    c.recordConfirmed(pushContext(),null);
+    c.recordConfirmed({...pushContext(),action}, {InstructionError:[2,21]});
+    assert.equal(c.snapshot(),null);
+    assert.doesNotThrow(()=>c.assertCanPush());
+  }
+});
+
+test("late push: reconcile identical bytes, maintain then LP, no second push or feed read", async () => {
+  const c = new KeeperMaintenanceContinuation(), gate = new PendingBroadcastGate<KeeperSendContext>();
+  const calls:string[]=[];
+  gate.record({context:pushContext(),rawTransaction:Uint8Array.of(1,2),
+    strategy:{signature:"old-push",blockhash:"hash",lastValidBlockHeight:200}});
+  let landed=false;
+  const tick = () => resumeBeforeFreshPush({signal:new AbortController().signal,continuation:c,
+    reconcile:async()=>{
+      const r=await gate.reconcile({
+        rebroadcast:async(bytes)=>{assert.deepEqual(bytes,Uint8Array.of(1,2));calls.push("same-bytes");return "old-push";},
+        confirm:async()=>{if(!landed)throw new KeeperFailure("pending","late");return {value:{err:null}};}});
+      if(r){calls.push("old-confirmed");c.recordConfirmed(r.context,null);}
+    },resume:async work=>{
+      assert.deepEqual(work.assetIndexes,[0,1,2]);assert.equal(work.minimumContextSlot,1030n);
+      calls.push("fresh-maintenance-read","maintenance","lp");
+      c.recordConfirmed({...pushContext(),action:"lp-crank"},null);
+    }});
+  await assert.rejects(tick());assert.equal(c.snapshot(),null);
+  landed=true;
+  const resumed=await tick();
+  if(!resumed)calls.push("new-feed-read","new-push");
+  assert.deepEqual(calls,["same-bytes","same-bytes","old-confirmed","fresh-maintenance-read","maintenance","lp"]);
+  assert.equal(gate.hasPending(),false);assert.equal(c.snapshot(),null);
+});
+
+test("late maintenance is reconciled before fresh bounded maintenance, never another push",async()=>{
+  const c=new KeeperMaintenanceContinuation();c.recordConfirmed(pushContext(),null);
+  const calls:string[]=[];
+  const resumed=await resumeBeforeFreshPush({signal:new AbortController().signal,continuation:c,
+    reconcile:async()=>{calls.push("old-maintenance-confirmed");c.recordConfirmed({...pushContext(),action:"loss-stale-heal"},null);},
+    resume:async()=>{calls.push("fresh-plan","one-new-bounded-batch","lp");c.recordConfirmed({...pushContext(),action:"lp-crank"},null);}});
+  assert.equal(resumed,true);
+  assert.deepEqual(calls,["old-maintenance-confirmed","fresh-plan","one-new-bounded-batch","lp"]);
+});
+
+test("late LP confirmation clears work, so next cycle does not duplicate settlement",async()=>{
+  const c=new KeeperMaintenanceContinuation();c.recordConfirmed(pushContext(),null);
+  assert.equal(await resumeBeforeFreshPush({signal:new AbortController().signal,continuation:c,
+    reconcile:async()=>c.recordConfirmed({...pushContext(),action:"lp-crank"},null),
+    resume:async()=>{assert.fail("duplicate settlement");}}),false);
+});
+
+test("expiry plus history miss does not mark maintenance or LP complete",async()=>{
+  for (const action of ["oracle-push","loss-stale-heal","lp-crank"]) {
+    const c=new KeeperMaintenanceContinuation(),gate=new PendingBroadcastGate<KeeperSendContext>();
+    if(action!=="oracle-push")c.recordConfirmed(pushContext(),null);
+    gate.record({context:{...pushContext(),action},rawTransaction:Uint8Array.of(1),
+      strategy:{signature:"expired",blockhash:"hash",lastValidBlockHeight:1}});
+    await assert.rejects(resumeBeforeFreshPush({signal:new AbortController().signal,continuation:c,
+      reconcile:async()=>{await gate.reconcile({confirm:async()=>{throw new KeeperFailure("expired","final history miss");}});},
+      resume:async()=>{assert.fail("expiry is not a successful confirmation");}}));
+    assert.equal(gate.hasPending(),false);
+    assert.equal(c.snapshot()!==null,action!=="oracle-push");
+  }
+});
+
+test("cancelled or failed resume retains continuation and does not read a new feed",async()=>{
+  for(const cancel of [true,false]){
+    const c=new KeeperMaintenanceContinuation();c.recordConfirmed(pushContext(),null);
+    const signal=new AbortController();let resumed=0;
+    await assert.rejects(resumeBeforeFreshPush({signal:signal.signal,continuation:c,
+      reconcile:async()=>{if(cancel)signal.abort();},resume:async()=>{resumed++;throw new KeeperFailure("rate_limit","read blocked");}}));
+    assert.equal(resumed,cancel?0:1);assert.ok(c.snapshot());assert.throws(()=>c.assertCanPush());
+  }
+});
+
+test("entry point reconciliation precedes plan construction; send path never hides a reconcile",()=>{
+  const s=readFileSync(new URL("./oracle-keeper-v16.ts",import.meta.url),"utf8");
+  const tick=s.slice(s.indexOf("async function tickInner"),s.indexOf("async function tick()"));
+  assert.ok(tick.indexOf("resumeBeforeFreshPush")<tick.indexOf("readOraclePrices(signal)"));
+  const send=s.slice(s.indexOf("async function sendIxs"),s.indexOf("async function simulateIxs"));
+  assert.doesNotMatch(send,/await reconcilePendingBroadcast/);
+  assert.match(send,/pendingBroadcasts.hasPending\(\)/);
+  assert.match(send,/assetIndexes: \[\.\.\.\(intent\?\.assetIndexes/);
+  assert.match(send,/maintenanceContinuation.recordConfirmed\(resolved.context, err\)/);
 });
