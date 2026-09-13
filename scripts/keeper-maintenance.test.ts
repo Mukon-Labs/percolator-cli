@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { planClockMaintenance, maintainBeforeLp, decodeMaintenanceResponse,
-  KeeperMaintenanceContinuation, resumeBeforeFreshPush, type KeeperSendContext } from "./keeper-maintenance.ts";
+  KeeperMaintenanceContinuation, resumeBeforeFreshPush, admitFreshPush,
+  MAX_PRE_PUSH_MARKET_LAG, type KeeperSendContext } from "./keeper-maintenance.ts";
 import { KeeperFailure, SingleTickRunner, PendingBroadcastGate } from "./keeper-runtime.ts";
 
 function fixture(slots = [1000n, 1000n, 1000n], lifecycle = slots.map(() => 2)) {
@@ -11,7 +12,7 @@ function fixture(slots = [1000n, 1000n, 1000n], lifecycle = slots.map(() => 2)) 
   data.writeBigUInt64LE(0x5045524356313600n, 0); data.writeUInt16LE(16, 8); data[10] = 1;
   data.set(market, 464); data.writeUInt32LE(slots.length, 464 + 281);
   data.writeBigUInt64LE(1000n, 464 + 581); data.writeBigUInt64LE(20n, 614);
-  slots.forEach((slot, i) => { data[1190+i*1797+512+16] = lifecycle[i]; data.writeBigUInt64LE(slot,1190+i*1797+512+41); });
+  slots.forEach((slot, i) => { data[1190+i*1797] = 3; data[1190+i*1797+512+16] = lifecycle[i]; data.writeBigUInt64LE(slot,1190+i*1797+512+41); });
   return { marketData: data, expectedMarket: market, contextSlot: 1030n,
     minimumContextSlot: 1020n, pushedAssetIndexes: [0,1,2] };
 }
@@ -274,4 +275,120 @@ test("entry point reconciliation precedes plan construction; send path never hid
   assert.match(send,/pendingBroadcasts.hasPending\(\)/);
   assert.match(send,/assetIndexes: \[\.\.\.\(intent\?\.assetIndexes/);
   assert.match(send,/maintenanceContinuation.recordConfirmed\(resolved.context, err\)/);
+});
+
+test("pre-push admission retains sixteen slots of the unchanged audit bound",async()=>{
+  assert.equal(MAX_PRE_PUSH_MARKET_LAG,48n);
+  for(const debt of [0n,48n,49n,82n,1000n]){
+    const f=fixture();f.contextSlot=1000n+debt;f.minimumContextSlot=1000n;
+    let batches=0;
+    const result=await admitFreshPush({signal:new AbortController().signal,
+      refreshFeed:async()=>{},
+      readPlan:async()=>planClockMaintenance(f),maintain:async p=>{batches++;assert.ok(p.cranks<=9);}});
+    assert.equal(result.admitted,debt<=48n);assert.equal(batches,debt<=48n?0:1);
+    assert.equal(result.observedSlot,f.contextSlot);
+  }
+});
+
+test("late LP confirmation followed by 82-slot debt gets maintenance, not another push",async()=>{
+  const c=new KeeperMaintenanceContinuation();c.recordConfirmed(pushContext(),null);
+  const calls:string[]=[];
+  assert.equal(await resumeBeforeFreshPush({signal:new AbortController().signal,continuation:c,
+    reconcile:async()=>{c.recordConfirmed({...pushContext(),action:"lp-crank"},null);calls.push("late-lp");},
+    resume:async()=>assert.fail("LP already confirmed")}),false);
+  const f=fixture();f.contextSlot=1082n;
+  const result=await admitFreshPush({signal:new AbortController().signal,
+    refreshFeed:async()=>{calls.push("fresh-feed");},
+    readPlan:async()=>{calls.push("fresh-read");return planClockMaintenance(f);},
+    maintain:async()=>{calls.push("maintenance-only");}});
+  if(result.admitted)calls.push("push","post-push-maintenance","lp");
+  assert.deepEqual(calls,["late-lp","fresh-read","maintenance-only","fresh-feed","fresh-read"]);
+  assert.equal(c.snapshot(),null);
+});
+
+test("pre-push read/maintenance failure and cancellation cannot grant admission",async()=>{
+  const f=fixture();f.contextSlot=1082n;
+  for(const phase of ["read","maintain","cancel-before","cancel-after-read","cancel-after-maintain"]){
+    const c=new AbortController();let batches=0;
+    if(phase==="cancel-before")c.abort();
+    await assert.rejects(admitFreshPush({signal:c.signal,
+      refreshFeed:async()=>{},
+      readPlan:async()=>{if(phase==="read")throw new KeeperFailure("rate_limit","read");
+        if(phase==="cancel-after-read")c.abort();return planClockMaintenance(f);},
+      maintain:async()=>{batches++;if(phase==="cancel-after-maintain")c.abort();
+        if(phase==="maintain")throw new KeeperFailure("pending","same signed bytes pending");}}));
+    assert.equal(batches,["maintain","cancel-after-maintain"].includes(phase)?1:0);
+  }
+});
+
+test("pre-push validates every live asset; Recovery is exempt, not unsupported live feeds",async()=>{
+  const f=fixture([1000n,1000n,0n],[2,3,5]);f.contextSlot=1082n;
+  f.marketData[1190+2*1797]=0;
+  const run=(input:ReturnType<typeof fixture>)=>admitFreshPush({signal:new AbortController().signal,
+    refreshFeed:async()=>{},
+    readPlan:async()=>planClockMaintenance(input),maintain:async p=>assert.deepEqual(p.assetIndexes,[0,1])});
+  assert.equal((await run(f)).admitted,false);
+  await assert.rejects(run({...f,pushedAssetIndexes:[0]}));
+  f.marketData[1190+1797]=0;await assert.rejects(run(f));
+  await assert.rejects(run(fixture([0n,0n,0n],[5,5,5])));
+});
+
+test("maintenance-only tick converges then admits fresh pushes without a permanent latch",async()=>{
+  let now=1082n,market=1000n,slots=[1000n,1000n,1000n],pushes=0,maintenanceOnly=0;
+  for(let tick=0;tick<200;tick++){
+    const f=fixture(slots);f.marketData.writeBigUInt64LE(market,464+581);
+    f.contextSlot=now;f.minimumContextSlot=market;
+    let batches=0;
+    const r=await admitFreshPush({signal:new AbortController().signal,
+      refreshFeed:async()=>{},
+      readPlan:async()=>planClockMaintenance(f),maintain:async p=>{
+        batches++;maintenanceOnly++;market=now;
+        slots=slots.map(s=>s+BigInt(p.cranks)*20n>now?now:s+BigInt(p.cranks)*20n);
+      }});
+    if(r.admitted){pushes++;market=now;slots=slots.map(()=>now);}
+    assert.ok(batches<=1);now+=30n;
+  }
+  assert.equal(maintenanceOnly,1);assert.equal(pushes,199);
+});
+
+test("runtime admission follows feed latency and precedes push; deferred tick has no second batch",()=>{
+  const s=readFileSync(new URL("./oracle-keeper-v16.ts",import.meta.url),"utf8");
+  const tick=s.slice(s.indexOf("async function tickInner"),s.indexOf("async function tick()"));
+  assert.ok(tick.indexOf("readOraclePrices(signal)")<tick.indexOf("await admitFreshPush"));
+  assert.ok(tick.indexOf("await admitFreshPush")<tick.indexOf("const push = await pushAssetsWithIsolation"));
+  assert.match(tick,/if \(!admission.admitted\) \{[\s\S]*?return;\s*\}/);
+  assert.match(tick,/const nowSlot = admission.observedSlot/);
+  assert.doesNotMatch(tick,/conn.getSlot/);
+  assert.match(tick,/if \(admission.maintenanceUsed\) \{[\s\S]*?return;\s*\}/);
+});
+
+test("repeated slow cycles refresh once after maintenance and push without a second batch",async()=>{
+  for(let cycle=0;cycle<100;cycle++){
+    const f=fixture();f.contextSlot=1082n;
+    let reads=0,batches=0,feeds=0;
+    const c=new KeeperMaintenanceContinuation();
+    const r=await admitFreshPush({signal:new AbortController().signal,
+      readPlan:async()=>{reads++;return planClockMaintenance(f);},
+      maintain:async()=>{batches++;f.marketData.writeBigUInt64LE(1082n,464+581);},
+      refreshFeed:async()=>{feeds++;f.contextSlot=1092n;}});
+    assert.deepEqual([reads,batches,feeds],[2,1,1]);
+    assert.deepEqual(r,{admitted:true,observedSlot:1092n,maintenanceUsed:true});
+    c.recordConfirmed({...pushContext(),observedSlot:r.observedSlot},null);
+    assert.ok(c.snapshot());assert.throws(()=>c.assertCanPush());
+    // Tick exits here; the existing continuation (not another push/LP now)
+    // owns the subsequent maintenance and settlement on the next tick.
+  }
+});
+
+test("post-maintenance feed failure and second-read regression never permit a push",async()=>{
+  for(const bad of ["feed","context","market"]){
+    const f=fixture();f.contextSlot=1082n;let batches=0;
+    await assert.rejects(admitFreshPush({signal:new AbortController().signal,
+      readPlan:async()=>planClockMaintenance(f),maintain:async()=>{batches++;},
+      refreshFeed:async()=>{if(bad==="feed")throw new KeeperFailure("transport","feed unavailable");
+        if(bad==="context")f.contextSlot=1081n;
+        else {f.marketData.writeBigUInt64LE(999n,464+581);f.marketData.writeBigUInt64LE(999n,1190+512+41);
+          f.marketData.writeBigUInt64LE(999n,1190+1797+512+41);f.marketData.writeBigUInt64LE(999n,1190+2*1797+512+41);}}}));
+    assert.equal(batches,1);
+  }
 });

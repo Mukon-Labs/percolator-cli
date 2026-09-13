@@ -63,7 +63,7 @@ import {
   type ConfirmationStrategy,
 } from "./keeper-runtime.ts";
 import { maintainBeforeLp, decodeMaintenanceResponse, KeeperMaintenanceContinuation,
-  resumeBeforeFreshPush, type KeeperSendContext, type MaintenanceContinuation,
+  resumeBeforeFreshPush, admitFreshPush, type KeeperSendContext, type MaintenanceContinuation,
   type ClockMaintenancePlan } from "./keeper-maintenance.ts";
 import {
   AssetQuarantine,
@@ -905,7 +905,7 @@ async function tickInner(signal: AbortSignal) {
     resume: work => resumeMaintenance(work, signal),
   })) return;
   currentTickPhase = "oracle-read";
-  const feedResult = await readOraclePrices(signal);
+  let feedResult = await readOraclePrices(signal);
 
   const unavailableKey = feedResult.unavailableIndexes.join(",");
   if (unavailableKey !== lastUnavailableFeedSet) {
@@ -917,8 +917,26 @@ async function tickInner(signal: AbortSignal) {
     }
   }
 
-  currentTickPhase = "slot-read";
-  const nowSlot = BigInt(await conn.getSlot("confirmed"));
+  // Replace the slot-only read with a validated account+context read AFTER
+  // external feed latency. Late LP reconciliation may have left an old market
+  // clock; use this tick's one maintenance batch before attempting another push.
+  currentTickPhase = "recovery-status";
+  const admission = await admitFreshPush({
+    signal,
+    readPlan: () => runHardDeadlineOperation({ parentSignal: signal, timeoutMs: 5_000,
+      work: readSignal => fetchMaintenancePlan(readSignal, KEEPER_ASSETS.map(a => a.index), 0n) }),
+    maintain: plan => maintainClocks(plan, signal),
+    refreshFeed: async () => {
+      currentTickPhase = "oracle-read";
+      feedResult = await readOraclePrices(signal);
+      currentTickPhase = "recovery-status";
+    },
+  });
+  if (!admission.admitted) {
+    console.log("  pre-push clock maintenance completed; fresh push deferred to next tick");
+    return;
+  }
+  const nowSlot = admission.observedSlot;
   const plans: AssetPushPlan[] = [];
   for (const a of KEEPER_ASSETS) {
     const item = feedResult.prices.get(a.index);
@@ -949,6 +967,13 @@ async function tickInner(signal: AbortSignal) {
         oraclePriceSource,
       })}`);
     }
+  }
+  if (admission.maintenanceUsed) {
+    // This tick spent its only maintenance budget before the push. Its newly
+    // confirmed push owns a continuation, resumed BEFORE prices next tick.
+    // No second batch or LP settlement against a not-yet-maintained new mark.
+    console.log(`  fresh push ${push.confirmed ? "confirmed; follow-up retained" : "simulated"} after pre-push maintenance; next tick required`);
+    return;
   }
   // Tx 2: bounded independent legless maintenance. Tx 3: LP settlement.
   // A failed/uncertain maintenance transaction cannot fall through to LP work.

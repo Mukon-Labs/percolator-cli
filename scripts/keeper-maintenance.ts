@@ -1,8 +1,11 @@
 import { KeeperFailure, readV16RecoveryStatus } from "./keeper-runtime.ts";
+import { DEFAULT_MAX_ORACLE_LEAD_SLOTS } from "./v16-market-coherence.ts";
 
 // Existing v16 deployment envelope: no larger batch/CU budget or engine dt.
 export const MAX_MAINTENANCE_CRANKS = 9;
 export const MAINTENANCE_HEADROOM_SLOTS = 40n;
+// Operational admission headroom, not a guarantee about future landing time.
+export const MAX_PRE_PUSH_MARKET_LAG = DEFAULT_MAX_ORACLE_LEAD_SLOTS - 16n;
 const GROUP = 16 + 448;
 const ASSETS = GROUP + 726;
 const ASSET_BYTES = 1797;
@@ -12,6 +15,8 @@ export interface ClockMaintenancePlan {
   assetIndexes: number[];
   blockedAssetIndexes: number[];
   observedSlot: bigint;
+  marketCurrentSlot: bigint;
+  authMarkAssetIndexes: number[];
   maxDebtSlots: bigint;
   maxAccrualDtSlots: bigint;
   cranks: number;
@@ -130,7 +135,7 @@ export function planClockMaintenance(input: {
     || [...pushed].some(i => !Number.isSafeInteger(i) || i < 0 || i >= count)) {
     throw new KeeperFailure("onchain", "maintenance asset indexes are invalid");
   }
-  const assetIndexes: number[] = [], blockedAssetIndexes: number[] = [];
+  const assetIndexes: number[] = [], blockedAssetIndexes: number[] = [], authMarkAssetIndexes: number[] = [];
   let maxDebtSlots = 0n;
   for (let i = 0; i < count; i++) {
     const engine = ASSETS + i * ASSET_BYTES + 512;
@@ -138,15 +143,58 @@ export function planClockMaintenance(input: {
     if (lifecycle !== 2 && lifecycle !== 3) continue;
     if (!pushed.has(i)) { blockedAssetIndexes.push(i); continue; }
     assetIndexes.push(i);
+    if (view.getUint8(ASSETS + i * ASSET_BYTES) === 3) authMarkAssetIndexes.push(i);
     const debt = input.contextSlot - view.getBigUint64(engine + 41, true);
     if (debt > maxDebtSlots) maxDebtSlots = debt;
   }
   const needed = (maxDebtSlots + MAINTENANCE_HEADROOM_SLOTS + dt - 1n) / dt;
   const capped = needed > BigInt(MAX_MAINTENANCE_CRANKS);
   return { assetIndexes, blockedAssetIndexes, observedSlot: input.contextSlot,
+    marketCurrentSlot: status.marketCurrentSlot, authMarkAssetIndexes,
     maxDebtSlots, maxAccrualDtSlots: dt,
     cranks: assetIndexes.length === 0 ? 0 : Number(capped ? BigInt(MAX_MAINTENANCE_CRANKS) : needed),
     capped: assetIndexes.length > 0 && capped };
+}
+
+/** A delayed LP/idle period must not knowingly become an oversized new push.
+ * A maintenance-only tick consumes the SAME batch budget as normal post-push
+ * work. Never combine the two, refresh oracle timestamps, or settle the LP here.
+ * The unchanged independent audit still handles execution-time latency. */
+export async function admitFreshPush(input: {
+  signal: AbortSignal;
+  readPlan(): Promise<ClockMaintenancePlan>;
+  maintain(plan: ClockMaintenancePlan): Promise<void>;
+  refreshFeed(): Promise<void>;
+}): Promise<{ admitted: boolean; observedSlot: bigint; maintenanceUsed: boolean }> {
+  const check = () => {
+    if (input.signal.aborted) throw new KeeperFailure("cancelled", "pre-push admission cancelled");
+  };
+  check();
+  const read = async () => {
+    const plan = await input.readPlan();
+    check();
+    if (plan.assetIndexes.length === 0 || plan.blockedAssetIndexes.length !== 0
+      || plan.authMarkAssetIndexes.length !== plan.assetIndexes.length) {
+      throw new KeeperFailure("onchain", "pre-push admission requires all live assets to be configured AuthMark assets");
+    }
+    return plan;
+  };
+  const plan = await read();
+  if (plan.observedSlot - plan.marketCurrentSlot <= MAX_PRE_PUSH_MARKET_LAG) {
+    return { admitted: true, observedSlot: plan.observedSlot, maintenanceUsed: false };
+  }
+  await input.maintain(plan);
+  check();
+  // Do not wait an entire tick cadence after catch-up or reuse a price fetched
+  // before it. Refresh once, re-read once, and never run a second batch here.
+  await input.refreshFeed();
+  check();
+  const after = await read();
+  if (after.observedSlot < plan.observedSlot || after.marketCurrentSlot < plan.marketCurrentSlot) {
+    throw new KeeperFailure("onchain", "pre-push market/context regressed after maintenance");
+  }
+  return { admitted: after.observedSlot - after.marketCurrentSlot <= MAX_PRE_PUSH_MARKET_LAG,
+    observedSlot: after.observedSlot, maintenanceUsed: true };
 }
 
 /** One fresh plan and at most one independently committed maintenance batch.
