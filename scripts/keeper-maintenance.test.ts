@@ -22,6 +22,16 @@ test("fresh head context triggers proactive work even with a clear lock and zero
   assert.equal(p.cranks, 4); assert.equal(p.maxDebtSlots, 30n);
   assert.equal(p.maxAccrualDtSlots,20n); assert.equal(p.capped,false);
 });
+test("ordinary batch keeps the full bounded landing envelope after an initially small debt", () => {
+  const plan = planClockMaintenance(fixture());
+  assert.equal(plan.cranks, 4);
+  const landingDebt = plan.maxDebtSlots + 90n;
+  assert.ok(BigInt(plan.cranks) * plan.maxAccrualDtSlots < landingDebt);
+  const layout = maintenanceBatchLayout(plan);
+  assert.equal(layout.settlesLp, true);
+  assert.equal(layout.leglessCranks + 1, 9);
+  assert.ok(BigInt(layout.leglessCranks) * plan.maxAccrualDtSlots >= landingDebt);
+});
 test("RPC response must have the expected owner, encoding and safe fresh context",()=>{
   const f=fixture();
   const input={...f,expectedOwner:"expected-program"};
@@ -171,7 +181,7 @@ const pushContext = (): KeeperSendContext => ({ action: "oracle-push", assetInde
 test("normal batches reserve exactly one of nine crank instructions for LP",()=>{
   const plan=planClockMaintenance(fixture());
   for(let cranks=1;cranks<=9;cranks++) {
-    assert.deepEqual(maintenanceBatchLayout({...plan,cranks,capped:false}),{leglessCranks:cranks-1,settlesLp:true});
+    assert.deepEqual(maintenanceBatchLayout({...plan,cranks,capped:false}),{leglessCranks:8,settlesLp:true});
     assert.deepEqual(maintenanceBatchLayout({...plan,cranks,capped:true}),{leglessCranks:cranks,settlesLp:false});
   }
   for(const bad of [{cranks:0},{cranks:10},{cranks:1.5},{assetIndexes:[]},

@@ -189,6 +189,7 @@ const conn = new Connection(RPC_URL, {
   // fetchMiddleware only rewrites request arguments; a custom fetch is needed
   // to put the actual HTTP request behind a wall-clock deadline.
   fetch: (url, options) => runHardDeadlineOperation({
+    phase: "base-rpc-http",
     parentSignal: rpcOperationSignals.currentSignal()
       ?? options?.signal
       ?? new AbortController().signal,
@@ -215,6 +216,7 @@ const magicBlockDemoConnection = oraclePriceSource === "magicblock-demo"
     disableRetryOnRateLimit: true,
     confirmTransactionInitialTimeout: TX_TIMEOUT_MS,
     fetch: (url, options) => runHardDeadlineOperation({
+      phase: "magicblock-rpc-http",
       parentSignal: rpcOperationSignals.currentSignal()
         ?? options?.signal
         ?? new AbortController().signal,
@@ -557,7 +559,7 @@ async function maintainClocks(plan: ClockMaintenancePlan, signal: AbortSignal) {
       return result;
     }),
   });
-  console.log(`  clock maintenance ${KEEPER_MODE === "shadow" ? "simulated" : "confirmed"}: cranks=${plan.cranks} lpAtomic=${layout.settlesLp} debt=${plan.maxDebtSlots} cap=${plan.maxAccrualDtSlots} bounded=${plan.capped} unavailable=${plan.blockedAssetIndexes.join(",") || "none"} elapsedMs=${Date.now() - startedAt}`);
+  console.log(`  clock maintenance ${KEEPER_MODE === "shadow" ? "simulated" : "confirmed"}: cranks=${layout.leglessCranks + Number(layout.settlesLp)} plannedMinimum=${plan.cranks} lpAtomic=${layout.settlesLp} debt=${plan.maxDebtSlots} cap=${plan.maxAccrualDtSlots} bounded=${plan.capped} unavailable=${plan.blockedAssetIndexes.join(",") || "none"} elapsedMs=${Date.now() - startedAt}`);
   return { ...result, settlesLp: layout.settlesLp };
 }
 
@@ -762,6 +764,7 @@ async function readHermesPrices(signal: AbortSignal): Promise<AvailablePythPushP
   // Keep the Hermes operation signal alive through headers, body parsing, and
   // configured-feed validation; a headers-only response must not outlive tick.
   const feedResult = await runHardDeadlineOperation({
+    phase: "hermes-feed",
     parentSignal: signal,
     timeoutMs: 5000,
     work: (hermesSignal) => fetchAvailableHermesFeeds({
@@ -885,7 +888,7 @@ async function resumeMaintenance(work: MaintenanceContinuation, signal: AbortSig
   // old by now; do not replay that transaction or use its cached slot/plan.
   const crank = await maintainBeforeLp({
     signal,
-    readPlan: () => runHardDeadlineOperation({ parentSignal: signal, timeoutMs: 5_000,
+    readPlan: () => runHardDeadlineOperation({ phase: "maintenance-plan", parentSignal: signal, timeoutMs: 5_000,
       work: (readSignal) => fetchMaintenancePlan(readSignal, KEEPER_ASSETS.map(a => a.index), work.minimumContextSlot) }),
     runBatch: plan => maintainClocks(plan, signal),
   });
@@ -927,7 +930,7 @@ async function tickInner(signal: AbortSignal) {
   currentTickPhase = "recovery-status";
   const admission = await admitFreshPush({
     signal,
-    readPlan: () => runHardDeadlineOperation({ parentSignal: signal, timeoutMs: 5_000,
+    readPlan: () => runHardDeadlineOperation({ phase: "maintenance-plan", parentSignal: signal, timeoutMs: 5_000,
       work: readSignal => fetchMaintenancePlan(readSignal, KEEPER_ASSETS.map(a => a.index), 0n) }),
     maintain: async plan => { await maintainClocks(plan, signal); },
     refreshFeed: async () => {
@@ -985,7 +988,7 @@ async function tickInner(signal: AbortSignal) {
     signal,
     readPlan: () => {
       currentTickPhase = "recovery-status";
-      return runHardDeadlineOperation({ parentSignal: signal, timeoutMs: 5_000,
+      return runHardDeadlineOperation({ phase: "maintenance-plan", parentSignal: signal, timeoutMs: 5_000,
         work: (readSignal) => fetchMaintenancePlan(readSignal, KEEPER_ASSETS.map(a => a.index), nowSlot) });
     },
     runBatch: plan => maintainClocks(plan, signal),
@@ -1044,7 +1047,7 @@ async function tick() {
       return;
     }
     consecutiveErrors++;
-    console.error(`  [${new Date().toISOString().slice(11, 19)}] Error #${consecutiveErrors}: ${safeErrorMessage(failure).slice(0, 140)}`);
+    console.error(`  [${new Date().toISOString().slice(11, 19)}] Error #${consecutiveErrors}: phase=${failure.phase ?? currentTickPhase} elapsedMs=${failure.elapsedMs ?? "unknown"} kind=${failure.kind} ${safeErrorMessage(failure).slice(0, 140)}`);
     const circuitBackoff = rpcCircuit.recordFailure(failure);
     if (circuitBackoff !== null) {
       // A provider outage must not create a Fly restart loop. Give a recovered

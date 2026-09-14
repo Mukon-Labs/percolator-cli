@@ -1,5 +1,32 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+
+test('deadline diagnostics attribute phase without changing timeout or success semantics', async () => {
+  const parentSignal = new AbortController().signal;
+  await assert.rejects(runHardDeadlineOperation({ parentSignal, timeoutMs: 5,
+    phase: 'maintenance-plan', work: () => new Promise(() => {}) }), (error: unknown) => {
+    assert.ok(error instanceof KeeperFailure);
+    assert.equal(error.kind, 'timeout'); assert.equal(error.phase, 'maintenance-plan');
+    assert.ok(error.elapsedMs! >= 0); return true;
+  });
+  assert.equal(await runHardDeadlineOperation({ parentSignal, timeoutMs: 100,
+    phase: 'base-rpc-http', work: async () => 7 }), 7);
+  await assert.rejects(runHardDeadlineOperation({ parentSignal, timeoutMs: 100,
+    phase: 'maintenance-plan', work: signal => runHardDeadlineOperation({
+      parentSignal: signal, timeoutMs: 5, phase: 'base-rpc-http', work: () => new Promise(() => {}) }) }),
+    (error: unknown) => { assert.ok(error instanceof KeeperFailure); assert.equal(error.phase, 'base-rpc-http'); return true; });
+  const parent = new AbortController();
+  await assert.rejects(runHardDeadlineOperation({ parentSignal: parent.signal, timeoutMs: 100,
+    phase: 'maintenance-plan', work: async () => {
+      const failure = new KeeperFailure('timeout', 'inner deadline');
+      failure.phase = 'base-rpc-http'; failure.elapsedMs = 5;
+      parent.abort(); throw failure;
+    } }), (error: unknown) => {
+      assert.ok(error instanceof KeeperFailure);
+      assert.equal(error.kind, 'cancelled');
+      return true;
+    });
+});
 import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import {
   AssetQuarantine,

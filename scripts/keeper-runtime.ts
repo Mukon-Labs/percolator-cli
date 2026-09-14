@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
 
 export type KeeperFailureKind = "cancelled" | "expired" | "onchain" | "pending" | "provider_denied" | "rate_limit" | "timeout" | "transport" | "unknown";
+export type KeeperOperationPhase = "base-rpc-http" | "magicblock-rpc-http" | "hermes-feed" | "maintenance-plan" | "confirmation-read";
 
 export class KeeperFailure extends Error {
+  phase?: KeeperOperationPhase;
+  elapsedMs?: number;
   constructor(
     public readonly kind: KeeperFailureKind,
     message: string,
@@ -558,11 +561,13 @@ export async function runDeadlineBoundOperation<T>(input: {
  * to release sockets promptly, but the returned promise never depends on it.
  */
 export async function runHardDeadlineOperation<T>(input: {
+  phase?: KeeperOperationPhase;
   clock?: Pick<Clock, "clearTimeout" | "setTimeout">;
   parentSignal: AbortSignal;
   timeoutMs: number;
   work(signal: AbortSignal): Promise<T>;
 }): Promise<T> {
+  const startedAt = Date.now();
   const linked = linkedAbortController(input.parentSignal);
   const operation = linked.controller;
   const clock = input.clock ?? systemClock;
@@ -593,15 +598,26 @@ export async function runHardDeadlineOperation<T>(input: {
   try {
     return await Promise.race([work, stopped]);
   } catch (error) {
+    let failure = error;
     if (operation.signal.aborted) {
-      throw new KeeperFailure(
+      failure = new KeeperFailure(
         input.parentSignal.aborted ? "cancelled" : "timeout",
         input.parentSignal.aborted
           ? "keeper operation cancelled"
           : deadlineExpired ? "keeper operation timed out" : "keeper operation cancelled",
       );
+      if (failure instanceof KeeperFailure && error instanceof KeeperFailure && error.phase) {
+        failure.phase = error.phase;
+        failure.elapsedMs = error.elapsedMs;
+      }
     }
-    throw error;
+    // Preserve innermost attribution without changing cancellation precedence.
+    // No provider URL, request body, signer, or response is attached.
+    if (failure instanceof KeeperFailure && input.phase && !failure.phase) {
+      failure.phase = input.phase;
+      failure.elapsedMs = Math.max(0, Date.now() - startedAt);
+    }
+    throw failure;
   } finally {
     clock.clearTimeout(timeout);
     removeAbortListener();

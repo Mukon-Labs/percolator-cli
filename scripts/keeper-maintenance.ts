@@ -166,7 +166,12 @@ export function maintenanceBatchLayout(plan: ClockMaintenancePlan): {
     || plan.authMarkAssetIndexes.length !== plan.assetIndexes.length) {
     throw new KeeperFailure("onchain", "maintenance batch requires all live configured AuthMark assets and a bounded plan");
   }
-  return { leglessCranks: plan.capped ? plan.cranks : plan.cranks - 1, settlesLp: !plan.capped };
+  // Planning context is not landing time. Use the already-reviewed nine-IX
+  // envelope even for ordinary upkeep: idle instructions do not move clocks
+  // into the future, while spare accrual capacity absorbs delayed inclusion.
+  // This is not a guarantee through an arbitrary RPC outage; capped recovery
+  // remains legless, and the independent audit remains authoritative.
+  return { leglessCranks: plan.capped ? plan.cranks : MAX_MAINTENANCE_CRANKS - 1, settlesLp: !plan.capped };
 }
 
 /** A delayed LP/idle period must not knowingly become an oversized new push.
